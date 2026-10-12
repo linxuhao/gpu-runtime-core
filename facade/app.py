@@ -23,7 +23,7 @@ STATE=Path(os.getenv('GPU_STATE','/state'))
 async def call(action,**arguments):
     transport=httpx.AsyncHTTPTransport(uds=str(STATE/'runtime.sock'))
     async with httpx.AsyncClient(transport=transport,timeout=930) as client:
-        response=await client.post('http://video/rpc',json={'action':action,'arguments':arguments})
+        response=await client.post('http://runtime/rpc',json={'action':action,'arguments':arguments})
     try:value=response.json()
     except ValueError:
         # Most often the runtime being down: a plain-text 500 with no error envelope.
