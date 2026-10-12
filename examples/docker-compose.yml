@@ -1,0 +1,37 @@
+# One host, a private network. From the checkout's root:
+#   mkdir -p state && cp examples/gpu-config.json state/ && edit it (nvidia-smi -L gives the UUID)
+#   head -c 32 /dev/urandom | base64 > state/gpu-api.token
+#   docker compose -f examples/docker-compose.yml up -d
+services:
+  runtime:
+    build: {context: .., dockerfile: examples/runtime.Dockerfile}
+    # Host pids: nvidia-smi reports processes on a card by host pid, and the runtime tells its own
+    # from anyone else's (a card with a process not its own is blocked, never killed).
+    pid: host
+    user: "1000:1000"
+    working_dir: /app
+    command: ["python3", "runtime/job_service.py", "--state", "/app/state"]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      PYTHONPATH: /app/plugins          # your tenant kinds, <kind>_tenant.py
+    volumes:
+      - ..:/app
+      - /opt/llama.cpp:/opt/llama.cpp:ro
+      - /models:/models:ro
+      - /var/lib/dpkg:/host/dpkg:ro     # the host's Mesa versions, for mesa_check
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu, compute, utility, graphics]}]
+    # An AMD card: also `devices: [/dev/dri, /dev/kfd]` and `group_add: [video, render]` (their gids).
+    restart: unless-stopped
+  facade:
+    build: ../facade
+    environment:
+      GPU_STATE: /state
+    volumes:
+      - ../state:/state
+    ports:
+      - "127.0.0.1:9041:9041"
+    restart: unless-stopped
