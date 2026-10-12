@@ -50,17 +50,21 @@ class RenderTests(unittest.TestCase):
         lane={**STATE['lanes']['gpu0'],'text':[
             {'tenant':'qwen3-fp8','kind':'vllm','window_s':30,'running':16,'waiting':0,'kv':0.64,'prefill_tps':1010.4,'decode_tps':275.8,
              'cache_hit':0.61,'accept':0.84,'stream':{'prefill_tps':1350.0,'decode_tps':18.8,'first_token_s':1.07}},
-            {'tenant':'qwen3-q4','kind':'llama.cpp','window_s':30,'running':1,'slots':1,'prefill_tps':0.0,'decode_tps':36.6,
-             'streams':[{'slot':0,'busy':True,'prefill_tps':0.0,'decode_tps':36.6,'prompt':41126,'cached':41101,'decoded':9997}]},
+            {'tenant':'qwen3-q4','kind':'llama.cpp','window_s':30,'running':1,'slots':1,'metrics':True,'prefill_tps':552.2,
+             'decode_tps':56.6,'decode_age_s':12,'accept':0.93,'streams':[{'slot':0,'busy':True,'prompt':41126,'cached':41101,'decoded':9997}]},
+            {'tenant':'asr-text','kind':'llama.cpp','window_s':30,'running':0,'slots':1,'metrics':False,'streams':[]},
             {'tenant':'translator','kind':'llama.cpp','window_s':0}]}
         text=self.draw({**STATE,'lanes':{'gpu0':lane}});lines=text.splitlines()
         everything=next(l for l in lines if 'qwen3-fp8' in l and 'all' in l)
         for part in ('prefill  1010 tok/s','decode   276 tok/s','16 running','cache hits 61%','KV 64%','MTP accepted 84%','last 30s'):self.assertIn(part,everything)
         stream=lines[lines.index(everything)+1]
         for part in ('stream','prefill  1350 tok/s','decode    19 tok/s','first token 1.1 s','mean per request'):self.assertIn(part,stream)
+        engine=next(l for l in lines if 'qwen3-q4' in l)
+        for part in ('engine','prefill   552 tok/s','decode    57 tok/s','MTP accepted 93%','1/1 slots busy','decode: last request 12s ago'):
+            self.assertIn(part,engine)
         slot=next(l for l in lines if 'slot 0' in l)
-        for part in ('decode    37 tok/s','prompt 41126 (41101 cached), 9997 decoded'):self.assertIn(part,slot)
-        self.assertIn('1/1 slots busy',text);self.assertIn('measuring...',next(l for l in lines if 'translator' in l and 'text' in l))
+        self.assertIn('prompt 41126 (41101 cached), 9997 decoded',slot);self.assertNotIn('tok/s',slot)
+        self.assertIn('speeds need llama-server --metrics',next(l for l in lines if 'asr-text' in l));self.assertIn('measuring...',next(l for l in lines if 'translator' in l and 'text' in l))
 
     def test_the_runtimes_warnings_come_first(self):
         text=self.draw({**STATE,'warnings':['Vulkan userspace differs from the host: mesa-vulkan-drivers: host .5, image .4']})

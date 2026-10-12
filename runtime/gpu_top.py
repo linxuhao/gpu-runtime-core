@@ -188,7 +188,8 @@ def clip(line, width):
 
 
 def speeds(text, paint):
-    """A text server's prefill and decode speeds (computed prompt tokens; see text_rates): in all, then per stream."""
+    """A text server's prefill and decode speeds (computed prompt tokens; see text_rates): vLLM's in all, then per
+    stream; llama-server's from its own timings, then each slot's request."""
     tps=lambda value:'%5s'%('?' if value is None else '%.0f'%value)
     pair=lambda item:'prefill %s tok/s  decode %s tok/s'%(tps(item.get('prefill_tps')),tps(item.get('decode_tps')))
     head='  '+paint('text ','1')+' %-10s %-9s '%(text['tenant'],text['kind'])
@@ -201,9 +202,14 @@ def speeds(text, paint):
         stream=text['stream'];first=stream.get('first_token_s')
         return [head+'all     '+pair(text)+'  '+', '.join(extra)+paint('  (last %ds)'%text['window_s'],'2'),
                 pad+'stream  '+pair(stream)+('  first token %.1f s'%first if first is not None else '')+paint('  (mean per request)','2')]
-    lines=[head+'all     '+pair(text)+'  %d/%d slots busy'%(text['running'],text['slots'])+paint('  (last %ds)'%text['window_s'],'2')]
+    busy='  %d/%d slots busy'%(text['running'],text['slots'])
+    if text.get('metrics'):
+        ages=['%s: last request %ds ago'%(phase,text[phase+'_age_s']) for phase in ('prefill','decode') if phase+'_age_s' in text]
+        accept='  MTP accepted %d%%'%round(100*text['accept']) if text.get('accept') is not None else ''
+        lines=[head+'engine  '+pair(text)+' per stream'+accept+busy+paint('  (last %ds%s)'%(text['window_s'],''.join('; '+age for age in ages)),'2')]
+    else:lines=[head+paint('speeds need llama-server --metrics','2')+busy]
     for slot in text['streams']:
-        lines.append(pad+'slot %-2d '%slot['slot']+pair(slot)+'  prompt %d (%d cached), %d decoded'%(slot['prompt'],slot['cached'],slot['decoded'])
+        lines.append(pad+'slot %-2d '%slot['slot']+'prompt %d (%d cached), %d decoded'%(slot['prompt'],slot['cached'],slot['decoded'])
                      +('' if slot['busy'] else paint('  done','2')))
     return lines
 

@@ -1,5 +1,5 @@
-"""text_rates turns the text servers' counters into prefill and decode speeds: per slot for
-llama-server, in all and per request on average for vLLM."""
+"""text_rates turns the text servers' counters into prefill and decode speeds: llama-server's own
+timings with each slot's progress, in all and per request on average for vLLM."""
 from pathlib import Path
 import sys
 import tempfile
@@ -29,6 +29,26 @@ vllm:kv_cache_usage_perc{engine="0",model_name="qwen3-fp8"} 0.64
 def vllm(**counters):
     base=dict(generated=0,prompt=0,hits=0,queries=0,itl=0,ttft=0,firsts=0,drafts=0,accepted=0);base.update(counters)
     return text_rates.parse_vllm(METRICS%base)
+
+
+LLAMA_METRICS='''# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total %(prompt)s
+llamacpp:prompt_seconds_total %(prompt_s)s
+llamacpp:tokens_predicted_total %(generated)s
+llamacpp:tokens_predicted_seconds_total %(generated_s)s
+llamacpp:spec_decode_num_draft_tokens_total %(drafts)s
+llamacpp:spec_decode_num_accepted_tokens_total %(accepted)s
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 99
+llamacpp:requests_processing 1
+'''
+
+
+def llama(slots, **counters):
+    """A llama-server reading: its slots, and its /metrics page (None: started without --metrics)."""
+    if counters.pop('off',False):return {'slots':text_rates.parse_llama(slots),'metrics':None}
+    base=dict(prompt=0,prompt_s=0,generated=0,generated_s=0,drafts=0,accepted=0);base.update(counters)
+    return {'slots':text_rates.parse_llama(slots),'metrics':text_rates.parse_metrics(LLAMA_METRICS%base,text_rates.LLAMA)}
 
 
 def slot(ident, task, computed, decoded, busy=True, cached=0):
@@ -68,17 +88,41 @@ class TextRatesTests(unittest.TestCase):
         rates.record('qwen3-fp8','gpu0','vllm',vllm(generated=100),5)
         self.assertEqual(rates.lane('gpu0')[0]['window_s'],0,'one reading of the new server: still measuring')
 
-    def test_llama_slots_each_and_added_up(self):
+    def test_llama_speeds_are_the_engines_own_timings(self):
         rates=TextRates()
-        rates.record('qwen3-q4','gpu1','llama.cpp',text_rates.parse_llama([slot(0,7,1000,50,cached=4000),slot(1,3,500,20,busy=False)]),0)
-        rates.record('qwen3-q4','gpu1','llama.cpp',text_rates.parse_llama([slot(0,7,1000,450,cached=4000),slot(1,3,500,20,busy=False)]),5)
-        rates.record('qwen3-q4','gpu1','llama.cpp',text_rates.parse_llama([slot(0,8,2000,100),slot(1,3,500,20,busy=False)]),10)
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,7,1000,50,cached=4000),slot(1,3,500,20,busy=False)]),0)
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,7,1000,450,cached=4000),slot(1,3,500,20,busy=False)],
+                                                        prompt=2000,prompt_s=4,generated=600,generated_s=10,drafts=200,accepted=180),5)
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,8,2000,100),slot(1,3,500,20,busy=False)],
+                                                        prompt=3800,prompt_s=7,generated=600,generated_s=10,drafts=200,accepted=180),10)
         [view]=rates.lane('gpu1')
-        self.assertEqual([s['slot'] for s in view['streams']],[0],'an idle slot that did nothing is left out')
-        self.assertEqual((view['streams'][0]['decode_tps'],view['streams'][0]['prefill_tps']),(50.0,200.0),
-                         '400 decoded by task 7, then task 8 started: its 2000 computed and 100 decoded count too')
-        self.assertEqual((view['decode_tps'],view['prefill_tps'],view['running'],view['slots']),(50.0,200.0,1,2))
-        self.assertEqual((view['streams'][0]['prompt'],view['streams'][0]['decoded']),(2000,100))
+        self.assertEqual((view['prefill_tps'],view['decode_tps'],view['accept']),(542.9,60.0,0.9),
+                         'tokens over the engine\'s seconds for each phase, not over the window')
+        self.assertEqual((view['running'],view['slots'],view['metrics'],view['window_s']),(1,2,True,10))
+        self.assertNotIn('decode_age_s',view)
+        self.assertEqual(view['streams'],[{'slot':0,'busy':True,'prompt':2000,'cached':0,'decoded':100}],'an idle slot that did nothing is left out')
+
+    def test_llama_decode_counted_at_the_end_shows_the_last_request_meanwhile(self):
+        rates=TextRates()
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,7,1000,10)],prompt=1000,prompt_s=2),0)
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,8,500,5)],prompt=1500,prompt_s=3,generated=570,generated_s=10),2)
+        for second in range(4,41,2):
+            rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,8,500,5+second*50)],prompt=1500,prompt_s=3,generated=570,generated_s=10),second)
+        [view]=rates.lane('gpu1')
+        self.assertEqual((view['decode_tps'],view['decode_age_s']),(57.0,38),'task 7 ended 38 s ago; task 8 is still decoding')
+        self.assertEqual((view['prefill_tps'],view['prefill_age_s']),(500.0,38))
+
+    def test_llama_without_metrics_says_so_and_still_shows_its_slots(self):
+        rates=TextRates()
+        for second in (0,2):rates.record('translator','gpu1','llama.cpp',llama([slot(0,1,10,second)],off=True),second)
+        [view]=rates.lane('gpu1')
+        self.assertFalse(view['metrics']);self.assertNotIn('decode_tps',view);self.assertEqual(view['streams'][0]['decoded'],2)
+
+    def test_a_restarted_llama_server_starts_its_window_over(self):
+        rates=TextRates()
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,1,10,10)],generated=9000,generated_s=100),0)
+        rates.record('qwen3-q4','gpu1','llama.cpp',llama([slot(0,1,10,10)],generated=100,generated_s=2),2)
+        self.assertEqual(rates.lane('gpu1')[0]['window_s'],0)
 
     def test_the_window_keeps_the_last_seconds_and_stopped_servers_go(self):
         rates=TextRates()
@@ -90,8 +134,8 @@ class TextRatesTests(unittest.TestCase):
 
     def test_a_server_moved_to_another_device_starts_over(self):
         rates=TextRates()
-        rates.record('translator','gpu1','llama.cpp',text_rates.parse_llama([slot(0,1,10,10)]),0)
-        rates.record('translator','gpu0','llama.cpp',text_rates.parse_llama([slot(0,1,10,10)]),2)
+        rates.record('translator','gpu1','llama.cpp',llama([slot(0,1,10,10)]),0)
+        rates.record('translator','gpu0','llama.cpp',llama([slot(0,1,10,10)]),2)
         self.assertEqual(rates.lane('gpu1'),[]);self.assertEqual(rates.lane('gpu0')[0]['window_s'],0)
 
 

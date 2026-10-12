@@ -52,7 +52,8 @@ print(reply.headers["x-gpu-device"], reply.parse().choices[0].message.content)
 ```
 
 `examples/docker-compose.yml` runs the same two processes in containers. `runtime/gpu_top.py` shows
-the cards, their queues and the text servers' prefill and decode speeds:
+the cards, their queues and the text servers' prefill and decode speeds, as the engines time them
+(vLLM's `/metrics`; llama-server's `/metrics`, so start it with `--metrics`):
 
 ```bash
 python3 runtime/gpu_top.py -w

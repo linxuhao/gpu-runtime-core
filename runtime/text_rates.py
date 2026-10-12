@@ -4,7 +4,10 @@ The service reads every running one each SAMPLE_S seconds and keeps WINDOW_S sec
 speeds are what happened in that window. Prefill counts only the prompt tokens computed, not those
 served from the prefix cache.
 
-- llama-server: /slots, per slot (exact: each slot is one request). The total is their sum.
+- llama-server: /metrics (needs `--metrics`), the engine's own prompt and generation times, the
+  same as its log's timings: prefill in all, decode per stream. They count a request's prompt as it
+  is computed but its generation only when it ends, so a window without one shows the last finished
+  request's speed and how long ago that was. /slots shows each request's progress.
 - vLLM: /metrics, the whole server. It has no per-request progress, so "per stream" is the mean
   over the requests of the window: decode from the inter-token latencies, prefill from the time to
   first token (which includes any wait in vLLM's own queue).
@@ -15,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import urllib.error
 import urllib.request
 
 SAMPLE_S=2
@@ -25,6 +29,9 @@ VLLM={'prompt':'vllm:prompt_tokens_total','hits':'vllm:prefix_cache_hits_total',
       'drafts':'vllm:spec_decode_num_draft_tokens_total','accepted':'vllm:spec_decode_num_accepted_tokens_total',
       'running':'vllm:num_requests_running','waiting':'vllm:num_requests_waiting','kv':'vllm:kv_cache_usage_perc'}
 GAUGES=('running','waiting','kv')
+LLAMA={'prompt':'llamacpp:prompt_tokens_total','prompt_s':'llamacpp:prompt_seconds_total',
+       'generated':'llamacpp:tokens_predicted_total','generated_s':'llamacpp:tokens_predicted_seconds_total',
+       'drafts':'llamacpp:spec_decode_num_draft_tokens_total','accepted':'llamacpp:spec_decode_num_accepted_tokens_total'}
 
 
 def kind_of(command):
@@ -52,14 +59,17 @@ def describe(command):
     return {'framework':kind,'build':build,'weights':os.path.basename(weights.rstrip('/')) if weights else None}
 
 
-def parse_vllm(text):
-    """The counters of VLLM from a /metrics page, each summed over its label sets."""
-    found={};names={v:k for k,v in VLLM.items()}
+def parse_metrics(text, table):
+    """The counters of `table` (VLLM or LLAMA) from a /metrics page, each summed over its label sets."""
+    found={};names={v:k for k,v in table.items()}
     for line in text.splitlines():
         match=re.match(r'([a-zA-Z_:]+)(\{[^}]*\})?\s+(\S+)$',line)
         if match and match.group(1) in names:
             key=names[match.group(1)];found[key]=found.get(key,0.0)+float(match.group(3))
     return found
+
+
+def parse_vllm(text):return parse_metrics(text,VLLM)
 
 
 def parse_llama(slots):
@@ -77,7 +87,11 @@ def parse_llama(slots):
 def read(url, kind, timeout=2):
     if kind=='vllm':
         with urllib.request.urlopen(url+'/metrics',timeout=timeout) as response:return parse_vllm(response.read().decode())
-    with urllib.request.urlopen(url+'/slots',timeout=timeout) as response:return parse_llama(json.loads(response.read()))
+    with urllib.request.urlopen(url+'/slots',timeout=timeout) as response:slots=parse_llama(json.loads(response.read()))
+    try:
+        with urllib.request.urlopen(url+'/metrics',timeout=timeout) as response:metrics=parse_metrics(response.read().decode(),LLAMA)
+    except urllib.error.HTTPError:metrics=None   # started without --metrics
+    return {'slots':slots,'metrics':metrics}
 
 
 def rate(amount, seconds):return round(amount/seconds,1) if seconds>0 else None
@@ -85,14 +99,25 @@ def rate(amount, seconds):return round(amount/seconds,1) if seconds>0 else None
 
 class TextRates:
     def __init__(self):
-        self.lock=threading.Lock();self.samples={}   # tenant -> (device, kind, deque of (time, reading))
+        self.lock=threading.Lock();self.samples={}   # tenant -> {device, kind, readings: deque of (time, reading), last}
 
     def record(self, tenant, device, kind, reading, now):
         with self.lock:
-            if self.samples.get(tenant,(None,None))[:2]!=(device,kind):self.samples[tenant]=(device,kind,deque())
-            readings=self.samples[tenant][2]
-            if kind=='vllm' and readings and reading.get('generated',0)<readings[-1][1].get('generated',0):
-                readings.clear()   # a new server: its counters started over
+            entry=self.samples.get(tenant)
+            if not entry or (entry['device'],entry['kind'])!=(device,kind):
+                entry=self.samples[tenant]={'device':device,'kind':kind,'readings':deque(),'last':{}}
+            readings=entry['readings'];counters=reading if kind=='vllm' else reading['metrics']
+            before=readings[-1][1] if readings else None
+            if before is not None and kind!='vllm':before=before['metrics']
+            if counters and before and counters.get('generated',0)<before.get('generated',0):
+                readings.clear();entry['last'].clear();before=None   # a new server: its counters started over
+            if kind=='llama.cpp' and counters and before:
+                # what finished between the two readings: kept for a window in which nothing does
+                for phase,tokens,seconds in (('prefill','prompt','prompt_s'),('decode','generated','generated_s')):
+                    took=counters.get(seconds,0)-before.get(seconds,0)
+                    if took>0:entry['last'][phase]=((counters.get(tokens,0)-before.get(tokens,0))/took,now)
+                drafts=counters.get('drafts',0)-before.get('drafts',0)
+                if drafts>0:entry['last']['accept']=((counters.get('accepted',0)-before.get('accepted',0))/drafts,now)
             readings.append((now,reading))
             while len(readings)>2 and now-readings[1][0]>=WINDOW_S:readings.popleft()
 
@@ -104,39 +129,38 @@ class TextRates:
     def lane(self, device):
         """The speeds of the text servers on a device, for resource_status."""
         with self.lock:
-            found=[(tenant,kind,list(readings)) for tenant,(on,kind,readings) in sorted(self.samples.items()) if on==device]
-        return [view for view in (self.view(tenant,kind,readings) for tenant,kind,readings in found) if view]
+            found=[(tenant,entry['kind'],list(entry['readings']),dict(entry['last'])) for tenant,entry in sorted(self.samples.items())
+                   if entry['device']==device]
+        return [view for view in (self.view(*item) for item in found) if view]
 
     @staticmethod
-    def view(tenant, kind, readings):
+    def view(tenant, kind, readings, last=None):
         if len(readings)<2:return {'tenant':tenant,'kind':kind,'window_s':0}
-        (start,first),(end,last)=readings[0],readings[-1];seconds=end-start
+        (start,first),(end,final)=readings[0],readings[-1];seconds=end-start
         out={'tenant':tenant,'kind':kind,'window_s':round(seconds)}
         if kind=='vllm':
-            delta={k:last.get(k,0)-first.get(k,0) for k in VLLM if k not in GAUGES}
+            delta={k:final.get(k,0)-first.get(k,0) for k in VLLM if k not in GAUGES}
             cached=delta['hits']/delta['queries'] if delta['queries']>0 else 0
             computed=delta['prompt']*(1-cached)
-            out.update(running=int(last.get('running',0)),waiting=int(last.get('waiting',0)),kv=round(last['kv'],2) if 'kv' in last else None,
+            out.update(running=int(final.get('running',0)),waiting=int(final.get('waiting',0)),kv=round(final['kv'],2) if 'kv' in final else None,
                        prefill_tps=rate(computed,seconds),decode_tps=rate(delta['generated'],seconds),cache_hit=round(cached,2),
                        stream={'prefill_tps':rate(computed,delta['ttft_s']),'decode_tps':rate(delta['generated'],delta['itl_s']),
                                'first_token_s':round(delta['ttft_s']/delta['ttft_n'],2) if delta['ttft_n'] else None},
                        accept=round(delta['accepted']/delta['drafts'],2) if delta['drafts'] else None)
             return out
-        # llama-server: what each slot did between two readings, added up over the window.
-        done={}
-        for (_,before),(_,after) in zip(readings,readings[1:]):
-            for slot,now in after.items():
-                was=before.get(slot)
-                if was is not None and was['task']==now['task']:
-                    computed,decoded=max(0,now['computed']-was['computed']),max(0,now['decoded']-was['decoded'])
-                else:computed,decoded=now['computed'],now['decoded']   # a request that started in between
-                total=done.setdefault(slot,[0,0]);total[0]+=computed;total[1]+=decoded
-        streams=[]
-        for slot,now in sorted(last.items()):
-            computed,decoded=done.get(slot,(0,0))
-            if not now['busy'] and not computed and not decoded:continue
-            streams.append({'slot':slot,'busy':now['busy'],'prefill_tps':rate(computed,seconds),'decode_tps':rate(decoded,seconds),
-                            'prompt':now['computed']+now['cached'],'cached':now['cached'],'decoded':now['decoded']})
-        out.update(running=sum(s['busy'] for s in last.values()),slots=len(last),streams=streams,
-                   prefill_tps=rate(sum(c for c,_ in done.values()),seconds),decode_tps=rate(sum(d for _,d in done.values()),seconds))
+        # llama-server: each slot's request as it stands, and the engine's timings over the window.
+        slots=final['slots'];was=first['slots']
+        out.update(running=sum(s['busy'] for s in slots.values()),slots=len(slots),
+                   streams=[{'slot':slot,'busy':now['busy'],'prompt':now['computed']+now['cached'],'cached':now['cached'],'decoded':now['decoded']}
+                            for slot,now in sorted(slots.items()) if now['busy'] or now!=was.get(slot)])
+        if final['metrics'] is None or first['metrics'] is None:
+            out['metrics']=False;return out
+        delta={k:final['metrics'].get(k,0)-first['metrics'].get(k,0) for k in LLAMA}
+        out['metrics']=True;last=last or {}
+        for phase,tokens,took in (('prefill','prompt','prompt_s'),('decode','generated','generated_s')):
+            if delta[took]>0:out[phase+'_tps']=rate(delta[tokens],delta[took])
+            elif phase in last:
+                out[phase+'_tps']=round(last[phase][0],1);out[phase+'_age_s']=round(end-last[phase][1])
+            else:out[phase+'_tps']=None
+        out['accept']=round(delta['accepted']/delta['drafts'],2) if delta['drafts'] else round(last['accept'][0],2) if 'accept' in last else None
         return out
