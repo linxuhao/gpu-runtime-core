@@ -115,10 +115,29 @@ A **server** (`"kind": "server"`, the default) is an HTTP server the runtime sta
 A **batch** tenant (`"kind": "batch"`) is one fresh process per job: `python script request.json out_dir`,
 whose last stdout line is the job's JSON result; `settings` and `timeout_s` (default 7200 s).
 
-A **service** is the short form for a server callers name by model: `names`, `placement` (`prefer`:
-the first backend's card, the second as its fallback; `spread`: one tenant per backend, each call to
-the least busy), `backends` (each with its own `device`, `api`, `command`, `url`, …), and `slots`,
-`routes`, `linger_s`, `spill`, `poll` for all of them.
+### tenants and services
+
+A **tenant** is what the scheduler places: one process (or a plugin tenant's parts) on its own card,
+with an optional fallback card. A **service** is what callers name: a model, never a card. The
+scheduler knows only tenants; when the config is loaded, each service becomes one or more server
+tenants.
+
+| | tenant | service |
+|---|---|---|
+| is | a server, a batch tenant or a plugin tenant, placed on a card | a name callers use, e.g. `qwen3-8b` |
+| kinds | `server`, `batch`, or a plugin's | HTTP servers only |
+| cards | its `device`, and optionally a `fallback` with its own launch there (`on`) | `backends`: one launch per card, each with its own `device`, `api`, `command`, `url`, … |
+| called | `/engines/<tenant>/…`, first in its card's queue | `/v1/…` by the body's `model`, in creation order with other jobs |
+
+`placement: "prefer"` (the default) makes one tenant named like the service: the first backend's card
+is its own, the second backend's its fallback, launched as that backend says (so at most two
+backends). `placement: "spread"` makes one tenant per backend, `<service>@<card>`, all running at once,
+each call going to the least busy. `names`, and `slots`, `routes`, `linger_s`, `spill`, `poll` for
+all of its backends, complete a service.
+
+Use a service when callers name the model, or when it is launched differently on different cards (a
+Vulkan build on one, a CUDA build on another); a tenant for a batch job, a plugin, or a server
+called by name that runs the same way wherever it is.
 
 `policy.idle.restore` lists what each card gets back when its queue is idle, on its own card only.
 
