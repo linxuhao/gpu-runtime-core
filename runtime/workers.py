@@ -14,6 +14,10 @@ import time
 import urllib.error
 import urllib.request
 
+# How long a worker may take to print its ready line. A resident CUDA worker that loads ~45 GB of
+# weights over a narrow PCIe link takes ~200 s warm and longer from a cold page cache.
+WORKER_READY_S = 600
+
 
 class Worker:
     """A JSON-lines worker: prints {"event":"ready"} once, then one result per request."""
@@ -28,7 +32,7 @@ class Worker:
             pass_fds=(lease_fd,), env=env)
         self.reader=threading.Thread(target=self._read, daemon=True)
         self.reader.start()
-        self.ready = self.receive('ready', 240)
+        self.ready = self.receive('ready', WORKER_READY_S)
 
     def _read(self):
         try:
