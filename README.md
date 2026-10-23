@@ -93,6 +93,7 @@ python3 runtime/gpu_top.py -w
 | `queue` | `priority` (default: calls by tenant name first, then by age), `fifo`, or `affinity` (also prefers jobs whose tenant is loaded, each passed over a bounded number of times) |
 | `vram_margin_gib` | kept free on an `lru` card beyond what the newcomer declares (default 0.5) |
 | `power_cap_w` | AMD: the card's hwmon power cap must be at or below this before anything starts |
+| `power_w` | NVIDIA: the card's power limit in W while no tenant using it declares one, and while it is lent (see [Power limits](#power-limits)) |
 | `vulkan_icd`, `vulkan_icd_path`, `vulkan_index` | which Vulkan driver manifest and which device of it a Vulkan process gets |
 
 ### tenants
@@ -112,6 +113,7 @@ A **server** (`"kind": "server"`, the default) is an HTTP server the runtime sta
 | `linger_s` | how long it keeps its card after a call before the idle residency comes back |
 | `fallback`, `on` | a second card, and how it is launched there (`on: {"gpu0": {"api": "cuda", "command": […]}}`) |
 | `spill` | also take its waiting calls on the fallback while its own card is busy with another tenant's job |
+| `power_w` | the power limit in W its card runs at while it is there (a card declaring `power_w` only) |
 
 A **batch** tenant (`"kind": "batch"`) is one fresh process per job: `python script request.json out_dir`,
 whose last stdout line is the job's JSON result; `settings` and `timeout_s` (default 7200 s).
@@ -133,7 +135,7 @@ tenants.
 `placement: "prefer"` (the default) makes one tenant named like the service: the first backend's card
 is its own, the second backend's its fallback, launched as that backend says (so at most two
 backends). `placement: "spread"` makes one tenant per backend, `<service>@<card>`, all running at once,
-each call going to the least busy. `names`, and `slots`, `routes`, `linger_s`, `spill`, `poll` for
+each call going to the least busy. `names`, and `slots`, `routes`, `linger_s`, `spill`, `poll`, `power_w` for
 all of its backends, complete a service.
 
 Use a service when callers name the model, or when it is launched differently on different cards (a
@@ -177,6 +179,22 @@ python3 runtime/gpu_drain.py --resume gpu1
 `--owner` (default user@host) says who borrows, `--label` what for; gpu_top and `gpu_borrow.py status`
 show both beside the lend.
 
+### Power limits
+
+An NVIDIA card that declares `power_w` runs at the lowest `power_w` of the tenants using it now (a
+plugin part may declare its own, else its tenant's), and at its own once none does or while it is
+lent. Setting a limit needs root and the runtime runs unprivileged, so it asks a helper of yours over
+a unix socket: `GPU_POWER_SOCKET`, default `state/power.sock`. One line of JSON each way:
+
+```
+-> {"uuid": "GPU-…", "watts": 250}
+<- {"ok": true}            or   {"ok": false, "error": "…"}
+```
+
+The helper decides which cards and which range it accepts (for example with
+`nvidia-smi -i UUID -pl WATTS`). It is best effort: a failed set is logged and the work runs at the
+card's current limit. An unchanged limit is sent again only after 60 s.
+
 ## Writing a tenant kind
 
 A tenant whose `kind` is neither `server` nor `batch` is run by the module `<kind>_tenant` on the
@@ -215,6 +233,7 @@ adding the actions that submit them (`tests/app_fixture.py`), and runs `job_serv
 | `HOST_DPKG_STATUS` | the host's dpkg status file, to compare its Mesa with the image's (default `/host/dpkg/status`) |
 | `GPU_STATE`, `GPU_TOKEN_FILE`, `GPU_TRUSTED_CLIENTS` | the facade's state directory, token file and trusted addresses |
 | `GPU_RUNTIME_SOCKET` | the socket the CLIs use (default `state/runtime.sock` beside the directory they run from) |
+| `GPU_POWER_SOCKET` | the power helper the runtime asks to set NVIDIA power limits (default `state/power.sock`) |
 
 ## Tests
 
