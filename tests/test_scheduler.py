@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -131,7 +132,7 @@ class Reply(io.BytesIO):
 class NativeImageTests(unittest.TestCase):
     def test_native_accepted_job_holds_phase_until_final_result(self):
         runtime=object.__new__(Scheduler);runtime.control=threading.RLock();runtime.tenants={'sd':{'device':'gpu0','routes':SD_ROUTES,'poll':SD_POLL}}
-        runtime.device_locks={'gpu0':threading.RLock()};runtime.uses={};runtime.used_at={};runtime.loading={};runtime.freed=threading.Condition(runtime.control)
+        runtime.device_locks={'gpu0':threading.RLock()};runtime.devices={'gpu0':SimpleNamespace(vendor='amd',power_w=None)};runtime.uses={};runtime.used_at={};runtime.loading={};runtime.freed=threading.Condition(runtime.control)
         runtime._server=lambda name,lane=None:type('Server',(),{'url':'http://127.0.0.1:19020'})()
         locked=[];calls=[]
         @contextlib.contextmanager

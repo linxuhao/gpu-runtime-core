@@ -12,11 +12,11 @@ CARD={'model':'NVIDIA RTX 4090','util':91.0,'used_mib':20480.0,'total_mib':65536
       'processes':{4242:20000.0,4343:10.0}}
 STATE={'mode':'loaded','draining':False,'queued':3,'workers':{'engines':{'translator':4242},'batches':{},'parts':{'pair.back':4343}},
        'lanes':{'gpu0':{'active':'take-a','step':'sample','queued':3,'blocked':None,
-                        'lent':{'job_id':'lend-x','device':'gpu0','owner':'lab-7','mode':'queued','granted':NOW-60,'deadline':NOW+3600},
+                        'lent':{'job_id':'lend-x','device':'gpu0','owner':'lab-7','label':'kl check','mode':'queued','granted':NOW-60,'deadline':NOW+3600},
                         'device':{'display':'RTX 4090','vendor':'nvidia','uuid':'GPU-1','pci':None},
                         'running':{'id':'take-a','kind':'render','status':'running','step':'sample','project':'p','shot':'s1','created':NOW-125},
                         'waiting':[{'id':'eng-1','kind':'engine','status':'queued','step':'engine','engine':'audio','created':NOW-5},
-                                   {'id':'lend-y','kind':'lend','status':'queued','step':'lend','owner':'lab-8','mode':'exclusive','created':NOW-30}]}}}
+                                   {'id':'lend-y','kind':'lend','status':'queued','step':'lend','owner':'lab-8','label':'PR A/B','mode':'exclusive','created':NOW-30}]}}}
 
 
 class RenderTests(unittest.TestCase):
@@ -26,13 +26,13 @@ class RenderTests(unittest.TestCase):
 
     def test_a_card_shows_its_readings_lend_job_and_queue_in_order(self):
         text=self.draw()
-        self.assertIn('lent queued to lab-7',text)
+        self.assertIn('lent queued to lab-7 (kl check)',text)
         self.assertIn(' 91%',text);self.assertIn('126/220 W',text);self.assertIn('20.0/64.0 GiB',text)
         run=next(l for l in text.splitlines() if l.lstrip().startswith('run'))
         self.assertIn('take-a',run);self.assertIn('render/sample',run);self.assertIn('p/s1',run);self.assertIn('2m ago',run)
         queue=[l for l in text.splitlines() if ' 1. ' in l or ' 2. ' in l]
         self.assertIn('eng-1',queue[0]);self.assertIn('audio',queue[0])
-        self.assertIn('lend-y',queue[1]);self.assertIn('lend (exclusive)',queue[1]);self.assertIn('lab-8',queue[1])
+        self.assertIn('lend-y',queue[1]);self.assertIn('lend (exclusive)',queue[1]);self.assertIn('lab-8 (PR A/B)',queue[1])
         self.assertIn('... 1 more',text,'queued counts more than the listed ones')
         self.assertIn('3 waiting',text.splitlines()[0],'what the queues hold, renders between stages included')
 

@@ -83,6 +83,11 @@ class ServiceStopping(Exception):
 def packed(value):return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False)
 
 
+def whose(lend):
+    """A lend's borrower and, when they gave one, what it is for."""
+    return lend['owner']+(' (%s)'%lend['label'] if lend.get('label') else '')
+
+
 
 class Service:
     PREFIXES={'engine':'call','lend':'lend','batch':'batch'}   # job id prefix by kind (an application adds its own)
@@ -295,7 +300,7 @@ class Service:
                 self.draining=False;self.needs_park=dict.fromkeys(self.lanes,hasattr(self.runtime,'park'));self.cv.notify_all()
                 return {'mode':'requested','load':'on the next job or idle residency restore'}
             if action=='resource_release':
-                if self.lends:raise ValueError('return the lent devices first: '+', '.join('%s to %s'%(lane,lend['owner']) for lane,lend in self.lends.items()))
+                if self.lends:raise ValueError('return the lent devices first: '+', '.join('%s to %s'%(lane,whose(lend)) for lane,lend in self.lends.items()))
                 if self.db.execute("SELECT count(*) FROM jobs WHERE waiting=1").fetchone()[0]:raise ValueError('cancel or finish queued jobs before releasing')
                 self.draining=True
                 if not self.running:self.runtime.stop()
@@ -357,7 +362,7 @@ class Service:
             lend=self.lends.get(lane)
             if lend and lend['mode']=='exclusive':
                 raise ValueError('%s is reserved for research by %s until %s; what needs it is refused until it is returned'
-                                 %(lane,lend['owner'],time.strftime('%Y-%m-%d %H:%M %Z',time.localtime(lend['deadline']))))
+                                 %(lane,whose(lend),time.strftime('%Y-%m-%d %H:%M %Z',time.localtime(lend['deadline']))))
         ident=uid(self.PREFIXES.get(kind,'job'));now=time.time()
         urgent=int(kind=='engine' and 'model' not in req)
         with self.db:self.db.execute('INSERT INTO jobs(id,project,shot,kind,status,request,result,error,created,updated,request_key,request_hash,lane,step,waiting,urgent)'
@@ -376,7 +381,12 @@ class Service:
             raise ValueError('hours must be above 0 and at most %d in %s mode'%(most,mode))
         owner=args.get('owner')
         if not isinstance(owner,str) or not 1<=len(owner.strip())<=100:raise ValueError('owner must say who borrows the device (1-100 characters)')
-        job=self._enqueue('',None,'lend',{'device':args.get('device'),'mode':mode,'hours':hours,'owner':owner.strip()},args.get('request_key'))
+        req={'device':args.get('device'),'mode':mode,'hours':hours,'owner':owner.strip()}
+        label=args.get('label')
+        if label is not None:
+            if not isinstance(label,str) or not 1<=len(label.strip())<=100:raise ValueError('label must say what the device is borrowed for (1-100 characters)')
+            req['label']=label.strip()
+        job=self._enqueue('',None,'lend',req,args.get('request_key'))
         self.heartbeats.setdefault(job['id'],time.time())
         return job
 
@@ -417,14 +427,14 @@ class Service:
         for row in rows:shutil.rmtree(self.state/'jobs'/row['id'],ignore_errors=True)
 
     def _lend_view(self, lend, env=False):
-        view={k:lend[k] for k in ('job_id','device','owner','mode','granted','deadline')}
+        view={k:lend[k] for k in ('job_id','device','owner','label','mode','granted','deadline') if k in lend}
         if env:view['env']=lend['env']
         return view
 
     def _queue_view(self, where, params):
         """Who a queue holds, for resource_status: a job without its request body (an engine
         call's can be 28 MB), plus who borrows (a lend) or which engine it calls."""
-        rows=self.db.execute("SELECT id,kind,status,step,project,shot,created,json_extract(request,'$.owner') AS owner,"
+        rows=self.db.execute("SELECT id,kind,status,step,project,shot,created,json_extract(request,'$.owner') AS owner,json_extract(request,'$.label') AS label,"
                              "json_extract(request,'$.mode') AS mode,json_extract(request,'$.engine') AS engine,json_extract(request,'$.model') AS model FROM jobs "+where,params)
         return [{k:v for k,v in dict(row).items() if v not in (None,'')} for row in rows]
 
@@ -598,6 +608,7 @@ class Service:
         else:
             now=time.time()
             record={'job_id':ident,'device':lane,'owner':req['owner'],'mode':req['mode'],'granted':now,'deadline':now+req['hours']*3600}
+            if req.get('label'):record['label']=req['label']
             env=self.runtime.lend(lane,record)
         with self.cv:
             if not restored:

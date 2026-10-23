@@ -40,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -58,6 +59,7 @@ VRAM_IDLE_BYTES=512*1024*1024
 GIB=1024**3
 VRAM_MARGIN_GIB=0.5    # kept free on an lru card beyond what the newcomer declares
 VRAM_SETTLE_S=10       # how long an evicted process's memory may take to show as free
+POWER_RESEND_S=60      # an unchanged power limit is sent again after this long (the helper may have restarted)
 SERVER_STARTUP_S=240   # how long a server tenant may take to answer its health route; `startup_s` raises it
 TENANT_BUSY_WAIT_S=930 # how long moving a tenant waits for a call using it on another device (one call: up to 900 s)
 # Where a Vulkan ICD manifest is looked for, in order: Mesa's RADV is under /usr/share; inside the
@@ -157,7 +159,7 @@ def expand_services(config):
     tenants=dict(config['tenants']);restore=list(config.get('policy',{}).get('idle',{}).get('restore',[]))
     for name,service in services.items():
         key='service '+name+': '
-        unknown=set(service)-{'names','placement','backends','slots','routes','linger_s','spill','poll'}
+        unknown=set(service)-{'names','placement','backends','slots','routes','linger_s','spill','poll','power_w'}
         if unknown:raise ValueError(key+'unknown fields '+', '.join(sorted(unknown)))
         placement=service.get('placement','prefer');backends=service.get('backends')
         if placement not in ('prefer','spread'):raise ValueError(key+'placement must be prefer or spread')
@@ -172,7 +174,7 @@ def expand_services(config):
             if missing:raise ValueError(key+'backend '+backend['device']+' needs '+', '.join(missing))
         common={'kind':'server','service':name,'models':list(service.get('names',[name])),
                 'routes':list(service.get('routes') or SERVICE_ROUTES)}
-        for key in ('slots','linger_s','spill','poll'):
+        for key in ('slots','linger_s','spill','poll','power_w'):
             if key in service:common[key]=service[key]
         if placement=='prefer':
             first,*rest=backends;spec={**common,**first}
@@ -206,6 +208,8 @@ def load_config(path):
             raise ValueError('device '+name+': "sharing" is replaced by "placement": exclusive, or lru with vram_gib per tenant')
         if spec.get('placement','exclusive') not in ('exclusive','lru'):raise ValueError('device '+name+': placement must be exclusive or lru')
         if spec.get('queue','priority') not in ('priority','fifo','affinity'):raise ValueError('device '+name+': queue must be priority, fifo or affinity')
+        if 'power_w' in spec and (spec['vendor']!='nvidia' or isinstance(spec['power_w'],bool) or not isinstance(spec['power_w'],(int,float)) or not 0<spec['power_w']<=2000):
+            raise ValueError('device '+name+': power_w is an NVIDIA card\'s limit in W, a number above 0, at most 2000')
     jobs={}   # job kind -> the tenant that runs it
     for name,spec in tenants.items():
         kind=spec.get('kind','server')
@@ -221,7 +225,7 @@ def load_config(path):
                                      and poll['prefix'].startswith('/') and poll['submit'] in (spec.get('routes') or SERVICE_ROUTES)):
             raise ValueError('tenant '+name+': poll must be {"submit": one of its routes, "field": the reply field naming the job, "prefix": "/path/of/its/jobs/"}')
         if not isinstance(spec.get('spill',False),bool):raise ValueError('tenant '+name+': spill must be true or false')
-        for key,most in (('linger_s',86400),('startup_s',3600),('vram_gib',1024)):
+        for key,most in (('linger_s',86400),('startup_s',3600),('vram_gib',1024),('power_w',2000)):
             for where,value in [(key,spec.get(key))]+[(device+'.'+key,launch.get(key)) for device,launch in spec.get('on',{}).items()]\
                     +[(part+'.'+key,slot.get(key)) for part,slot in parts.items() if part]:
                 if value is not None and (isinstance(value,bool) or not isinstance(value,(int,float)) or not 0<value<=most):
@@ -278,7 +282,8 @@ class Device:
         self.name=name;self.vendor=spec['vendor'];self.pci=spec.get('pci');self.uuid=spec.get('uuid')
         self.display=spec.get('name',name);self.placement=spec.get('placement','exclusive');self.queue=spec.get('queue','priority')
         self.vram_margin=spec.get('vram_margin_gib',VRAM_MARGIN_GIB)*GIB
-        self.power_cap_w=spec.get('power_cap_w');self.vulkan_icd=spec.get('vulkan_icd','radeon' if self.vendor=='amd' else 'nvidia')
+        self.power_cap_w=spec.get('power_cap_w');self.power_w=spec.get('power_w')   # power_w: an NVIDIA card's limit while no tenant declares one
+        self.vulkan_icd=spec.get('vulkan_icd','radeon' if self.vendor=='amd' else 'nvidia')
         self.vulkan_index=spec.get('vulkan_index',0);self.vulkan_icd_path=spec.get('vulkan_icd_path')
 
     def sysfs(self):return Path('/sys/bus/pci/devices')/self.pci
@@ -370,6 +375,10 @@ class Scheduler:
         # (tenant, device) -> calls using it there now, counted from before it is placed there: another
         # device's queue does not move it meanwhile (see _leave). `freed` is signalled as each one ends.
         self.uses={};self.freed=threading.Condition(self.control)
+        # Power: an NVIDIA card declaring power_w runs at the lowest power_w of the tenants using it
+        # (see _power), set through a root helper's socket; device -> (W, when) last set.
+        self.power_socket=os.environ.get('GPU_POWER_SOCKET') or str(self.state/'power.sock')
+        self.power_lock=threading.Lock();self.power_sent={}
         self.loading={}                # tenant -> the device a queue is starting it on (E22: one process per tenant)
         # Tenants of a kind a plugin runs (TenantKind), and the job kinds they run.
         self.plugins={name:tenant_kind(name,spec)(self,name,spec) for name,spec in self.tenants.items() if spec.get('kind','server') not in ('server','batch')}
@@ -460,7 +469,8 @@ class Scheduler:
     def _usable(self, device):
         """Refuse to place anything of ours on a lent or blocked device."""
         if device.name in self.lent:
-            raise RuntimeError('%s (%s) is lent to %s'%(device.name,device.display,self.lent[device.name].get('owner','research')))
+            lend=self.lent[device.name]
+            raise RuntimeError('%s (%s) is lent to %s'%(device.name,device.display,lend.get('owner','research')+(' (%s)'%lend['label'] if lend.get('label') else '')))
         if device.name in self.blocked:
             raise RuntimeError('%s (%s) is blocked: %s'%(device.name,device.display,self.blocked[device.name]))
 
@@ -523,14 +533,47 @@ class Scheduler:
 
     @contextlib.contextmanager
     def _using(self, name, device):
-        """`name` is in use on `device` while the block runs (see _leave)."""
+        """`name` is in use on `device` while the block runs (see _leave), at its power limit (_power)."""
         with self.control:self.uses[name,device]=self.uses.get((name,device),0)+1;self.used_at[name]=time.monotonic()
-        try:yield
+        try:
+            self._power(device)
+            yield
         finally:
             with self.control:
                 self.uses[name,device]-=1;self.used_at[name]=time.monotonic()
                 if not self.uses[name,device]:del self.uses[name,device]
                 self.freed.notify_all()
+            self._power(device)
+
+    def power_of(self, name):
+        """The power limit (W) tenant or part `name` declares: the part's own power_w, else its tenant's."""
+        tenant,_,part=name.partition('.');spec=self.tenants.get(tenant) or {}
+        slot=spec.get(part) if part else None
+        return slot['power_w'] if isinstance(slot,dict) and 'power_w' in slot else spec.get('power_w')
+
+    def _power(self, device):
+        """An NVIDIA card that declares power_w: the lowest power_w among the tenants using it now,
+        its own once none does (a lent card too). Set through the root helper on power_socket (the
+        runtime runs unprivileged); best effort: a failure is logged and the work runs at whatever
+        limit the card has."""
+        card=self.devices[device]
+        if card.vendor!='nvidia' or card.power_w is None:return
+        with self.power_lock:
+            with self.control:users=[n for (n,d),c in self.uses.items() if d==device and c]
+            caps=[w for w in map(self.power_of,users) if w is not None]
+            watts=min(caps) if caps else card.power_w
+            last=self.power_sent.get(device)
+            if last and last[0]==watts and time.monotonic()-last[1]<POWER_RESEND_S:return
+            try:
+                with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:
+                    s.settimeout(5);s.connect(self.power_socket)
+                    s.sendall((json.dumps({'uuid':card.uuid,'watts':watts})+'\n').encode())
+                    reply=json.loads(s.makefile('r').readline() or '{}')
+                if not reply.get('ok'):raise RuntimeError(reply.get('error') or 'no reply')
+                self.power_sent[device]=(watts,time.monotonic())
+            except Exception as exc:
+                self.power_sent.pop(device,None)
+                print('%s: power limit %gW not set: %s'%(device,watts,exc),file=sys.stderr,flush=True)
 
     def _place(self, name, device):
         """Make room on `device` for `name`. Exclusive: everyone else leaves. LRU: the others stay
@@ -742,6 +785,7 @@ class Scheduler:
             self._lease()
             for tenant in self._occupants(device):self._stop_tenant(tenant,name)
             with self.control:self.lent[name]=dict(record)
+            self._power(name)   # the borrower gets the card's own limit
             self._refresh()
         return self._lend_env(device)
 

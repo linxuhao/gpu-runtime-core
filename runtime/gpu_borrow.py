@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Borrow one GPU from the GPU runtime for research, through its job queue.
 
-  gpu_borrow.py run --device gpu0 [--hours 2] -- python train.py ...
+  gpu_borrow.py run --device gpu0 [--hours 2] [--label WHAT] -- python train.py ...
       Queued mode: waits its turn among the agent jobs on that device, runs the command with
       only that device visible, and gives the device back when the command ends. At the
       deadline the command gets SIGTERM, and SIGKILL a minute later. Exits with its exit code.
-  gpu_borrow.py reserve --device gpu0 [--hours 72]
+  gpu_borrow.py reserve --device gpu0 [--hours 72] [--label WHAT]
       Exclusive mode: waits its turn, then the device is research's until `release` or the
       deadline; meanwhile new jobs that need it are refused. Prints the environment to use.
   gpu_borrow.py release LEND_ID
@@ -83,8 +83,9 @@ def wait_for_grant(path, ident):
 
 
 def submit(path, args, mode):
+    extra={'label':args.label} if args.label else {}
     return call(path,'lend_submit',device=args.device,mode=mode,hours=args.hours,owner=args.owner,
-                request_key='borrow-'+uuid.uuid4().hex)
+                request_key='borrow-'+uuid.uuid4().hex,**extra)
 
 
 def run(path, args):
@@ -129,7 +130,7 @@ def status(path):
     state=call(path,'resource_status')
     for lane,info in state.get('lanes',{}).items():
         lent=info['lent'];line='%-6s queued %-3d active %s'%(lane,info['queued'],info['active'] or '-')
-        if lent:line+='  lent (%s) to %s until %s [%s]'%(lent['mode'],lent['owner'],when(lent['deadline']),lent['job_id'])
+        if lent:line+='  lent (%s) to %s until %s [%s]'%(lent['mode'],lent['owner']+(' (%s)'%lent['label'] if lent.get('label') else ''),when(lent['deadline']),lent['job_id'])
         if info['blocked']:line+='  BLOCKED: '+info['blocked']
         print(line)
     return 0
@@ -143,6 +144,7 @@ def main(argv=None):
         p=sub.add_parser(name);p.add_argument('--device',required=True)
         p.add_argument('--hours',type=float,default=None,help='default 2 for run, 72 for reserve')
         p.add_argument('--owner',default=getpass.getuser()+'@'+socket.gethostname())
+        p.add_argument('--label',help='what the device is for, shown beside the owner in the queue and gpu_top')
         if name=='run':p.add_argument('command',nargs=argparse.REMAINDER)
     sub.add_parser('release').add_argument('lend_id')
     sub.add_parser('status')

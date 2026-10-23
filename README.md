@@ -168,11 +168,14 @@ with the same request returns the same job, with another request it is refused.
 
 ```bash
 python3 runtime/gpu_borrow.py run --device gpu0 --hours 2 -- python train.py   # queued; only gpu0 visible
-python3 runtime/gpu_borrow.py reserve --device gpu0 --hours 72                 # exclusive; prints the env
+python3 runtime/gpu_borrow.py reserve --device gpu0 --hours 72 --label "fine-tune"   # exclusive; prints the env
 python3 runtime/gpu_borrow.py release LEND_ID
 python3 runtime/gpu_drain.py gpu1              # finish its queue, take nothing new, then empty it
 python3 runtime/gpu_drain.py --resume gpu1
 ```
+
+`--owner` (default user@host) says who borrows, `--label` what for; gpu_top and `gpu_borrow.py status`
+show both beside the lend.
 
 ## Writing a tenant kind
 

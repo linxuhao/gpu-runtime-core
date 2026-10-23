@@ -159,16 +159,21 @@ def what_of(job):
     return what+(' ('+job['mode']+')' if job.get('mode') else '')
 
 
+def whose(job):
+    """A lend's borrower and, when they gave one, what it is for."""
+    return job.get('owner','')+(' (%s)'%job['label'] if job.get('label') else '')
+
+
 def describe(job, now):
     """One queue entry: id, what it is, whose."""
-    who=job.get('owner') or job.get('engine') or '/'.join(x for x in (job.get('project'),job.get('shot')) if x)
+    who=whose(job) or job.get('engine') or '/'.join(x for x in (job.get('project'),job.get('shot')) if x)
     if job.get('model') and job.get('engine'):who=job['model']+' -> '+job['engine']
     return '%-26s %-18s %6s ago  %s'%(job['id'],what_of(job),ago(now-job['created']),who)   # whose last: a narrow screen cuts it
 
 
 def unlisted(hidden, more):
     """The queue entries left out, in one line: how many, of what and whose."""
-    groups=Counter('%s %s'%(what_of(job),job.get('owner') or job.get('model') or job.get('engine') or job.get('project') or '') for job in hidden)
+    groups=Counter('%s %s'%(what_of(job),whose(job) or job.get('model') or job.get('engine') or job.get('project') or '') for job in hidden)
     parts=['%d %s'%(n,key.strip()) for key,n in groups.most_common(3)]
     if len(groups)>3:parts.append('%d other'%sum(n for _,n in groups.most_common()[3:]))
     if more>len(hidden):parts.append('%d not listed by the runtime'%(more-len(hidden)))
@@ -246,7 +251,7 @@ def frame(state, error, devices, nvidia, amd, width, paint, now, limit):
         info=(state or {}).get('lanes',{}).get(lane,{})
         title=paint(lane,'1;36')+'  '+device.get('display',lane)+(paint('  ('+card['model']+')','2') if card and card.get('model') else '')
         if info.get('lent'):
-            lent=info['lent'];title+='  '+paint('lent %s to %s until %s'%(lent['mode'],lent['owner'],time.strftime('%m-%d %H:%M',time.localtime(lent['deadline']))),'35')
+            lent=info['lent'];title+='  '+paint('lent %s to %s until %s'%(lent['mode'],whose(lent),time.strftime('%m-%d %H:%M',time.localtime(lent['deadline']))),'35')
         if info.get('blocked'):title+='  '+paint('blocked: '+info['blocked'],'31')
         if info.get('drained'):title+='  '+paint('drained: finishes its queue, takes nothing new','33')
         modes=(info.get('device') or {})

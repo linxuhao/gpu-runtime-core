@@ -112,8 +112,8 @@ class QueueHarness(unittest.TestCase):
         return self.call('render',request={'prompt':prompt or key,'origin':ORIGIN,**kw},request_key=key)
     def engine(self,key,path='/v1/audio/transcriptions'):
         return self.call('engine_submit',engine='audio',path=path,method='POST',body='',content_type='audio/wav',request_key=key)
-    def lend(self,key,device='gpu0',mode='queued',hours=1,owner='lab'):
-        return self.call('lend_submit',device=device,mode=mode,hours=hours,owner=owner,request_key=key)
+    def lend(self,key,device='gpu0',mode='queued',hours=1,owner='lab',**extra):
+        return self.call('lend_submit',device=device,mode=mode,hours=hours,owner=owner,request_key=key,**extra)
     def job(self,j):return self.call('job_get',job_id=j['id'])
     def wait(self,j,timeout=5):return self.call('job_wait',job_id=j['id'],timeout=timeout)
     def until(self,predicate,timeout=5,what='condition'):
@@ -215,12 +215,12 @@ class LaneTests(QueueHarness):
     def test_status_lists_who_runs_and_who_waits_without_request_bodies(self):
         sampling=self.rt.gate('sample:a');a=self.render('a');self.rt.wait_started('sample:a')
         encoding=self.rt.gate('encode:b');b=self.render('b');self.rt.wait_started('encode:b')
-        c=self.render('c');e=self.engine('e');lend=self.lend('l',owner='lab-7')
+        c=self.render('c');e=self.engine('e');lend=self.lend('l',owner='lab-7',label=' kl check ')
         lanes=self.call('resource_status')['lanes']
         running=lanes['gpu0']['running']
         self.assertEqual((running['id'],running['kind'],running['step'],running['project'],running['shot']),(a['id'],'render','sample','project-fixture','shot-fixture'))
         self.assertNotIn('request',running)
-        self.assertEqual([(j['id'],j.get('owner'),j.get('mode')) for j in lanes['gpu0']['waiting']],[(lend['id'],'lab-7','queued')])
+        self.assertEqual([(j['id'],j.get('owner'),j.get('label'),j.get('mode')) for j in lanes['gpu0']['waiting']],[(lend['id'],'lab-7','kl check','queued')])
         self.assertEqual([j['id'] for j in lanes['gpu1']['waiting']],[e['id'],c['id']],'engine calls first, then by creation')
         self.assertEqual(lanes['gpu1']['waiting'][0]['engine'],'audio')
         self.assertEqual(lanes['gpu1']['running']['id'],b['id'])
@@ -301,12 +301,14 @@ class LendRestartTests(unittest.TestCase):
     def test_a_granted_lend_is_recorded_with_its_job(self):
         rt=LaneRuntime();s=Service(ROOT,self.state,rt)
         try:
-            j=s.call('lend_submit',{'device':'gpu0','mode':'exclusive','hours':1,'owner':'trainer','request_key':'k'})
+            j=s.call('lend_submit',{'device':'gpu0','mode':'exclusive','hours':1,'owner':'trainer','label':'PR A/B','request_key':'k'})
             deadline=time.monotonic()+5
             while s.call('lend_get',{'job_id':j['id']})['granted'] is None:
                 self.assertLess(time.monotonic(),deadline);time.sleep(.01)
             lent=s.call('job_get',{'job_id':j['id']})['lent']
-            self.assertEqual((lent['device'],lent['mode'],lent['owner']),('gpu0','exclusive','trainer'));self.assertGreater(lent['deadline'],time.time())
+            self.assertEqual((lent['device'],lent['mode'],lent['owner'],lent['label']),('gpu0','exclusive','trainer','PR A/B'));self.assertGreater(lent['deadline'],time.time())
+            self.assertEqual(s.call('resource_status',{})['lanes']['gpu0']['lent']['label'],'PR A/B')
+            with self.assertRaisesRegex(ValueError,'reserved for research by trainer \\(PR A/B\\)'):s.call('render',{'request':{'prompt':'x','origin':ORIGIN},'request_key':'r'})
             s.call('lend_return',{'job_id':j['id']});s.call('job_wait',{'job_id':j['id'],'timeout':5})
         finally:s.close()
     def test_a_granted_lend_survives_a_service_stop(self):
@@ -446,7 +448,8 @@ class LendTests(QueueHarness):
     def test_requests_are_checked(self):
         for args,message in (({'device':'gpu9'},'unknown device'),({'mode':'forever'},'mode must be'),
                              ({'hours':0},'hours must be'),({'hours':13},'at most 12 in queued'),
-                             ({'mode':'exclusive','hours':24*15},'at most 336'),({'owner':' '},'owner')):
+                             ({'mode':'exclusive','hours':24*15},'at most 336'),({'owner':' '},'owner'),
+                             ({'label':' '},'label'),({'label':'x'*101},'label'),({'label':7},'label')):
             with self.subTest(args=args),self.assertRaisesRegex(ValueError,message):
                 self.call('lend_submit',**{'device':'gpu0','mode':'queued','hours':1,'owner':'lab','request_key':'bad',**args})
         self.assertEqual(self.lend('ok',mode='exclusive',hours=24*14)['kind'],'lend')
@@ -657,10 +660,10 @@ class BorrowCliTests(unittest.TestCase):
             self.assertLess(time.monotonic(),deadline,'the command outlived the tool');time.sleep(.05)
 
     def test_reserve_status_and_release(self):
-        done=self.borrow('reserve','--device','gpu0','--owner','trainer','--hours','24')
+        done=self.borrow('reserve','--device','gpu0','--owner','trainer','--label','PR A/B','--hours','24')
         self.assertEqual(done.returncode,0,done.stderr);self.assertIn('export CUDA_VISIBLE_DEVICES=GPU-gpu0',done.stdout)
         [row]=self.lends();self.assertEqual(row['status'],'running')
-        status=self.borrow('status');self.assertIn('lent (exclusive) to trainer',status.stdout)
+        status=self.borrow('status');self.assertIn('lent (exclusive) to trainer (PR A/B)',status.stdout)
         self.assertEqual(self.borrow('release',row['id']).stdout.strip(),'running')
         self.assertEqual(self.s.call('job_wait',{'job_id':row['id'],'timeout':5})['status'],'completed')
 
