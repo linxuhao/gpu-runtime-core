@@ -60,6 +60,7 @@ def tenant_column():
 # research's for days, and new jobs that need it are refused meanwhile.
 LEND_HOURS={'queued':(2,12),'shared':(2,12),'exclusive':(72,14*24)}     # mode -> (default, most)
 LEND_HEARTBEAT_S=180       # a borrower silent this long has gone: its request or its device is taken back
+LEND_SWEEP_S=30            # how often lends still waiting are looked at for a borrower gone silent
 BLOCKED_RECHECK_S=10       # how often a device blocked by a process not ours is looked at again
 STATUS_WAITING_MAX=50     # resource_status lists at most this many waiting jobs per device (`queued` counts all)
 IDLE_COALESCE_S=5          # a device's queue idle this long gets its idle residency back
@@ -162,6 +163,8 @@ class Service:
                 continue
             env=self.runtime.restore_lend(lane,record)
             self.lends[lane]=dict(record,env=env);self.heartbeats[ident]=time.time();self.resumed[lane]=ident
+        # Lends that were waiting: their silence counts from now (the borrowers may be retrying).
+        for row in self.db.execute("SELECT id FROM jobs WHERE kind='lend' AND status='queued'").fetchall():self.heartbeats[row['id']]=time.time()
         with self.cv:self._relane()
         # Queued before there were queues per device: placed at their first stage now.
         for row in self.db.execute("SELECT id FROM jobs WHERE status='queued' AND (lane IS NULL OR waiting=0)").fetchall():
@@ -173,10 +176,12 @@ class Service:
             with self.db:self.db.execute('UPDATE jobs SET lane=?,step=?,waiting=1 WHERE id=?',(lane,stage,job['id']))
         self.needs_park=dict.fromkeys(self.lanes,hasattr(self.runtime,'park'))
         self.threads={lane:threading.Thread(target=self._work,args=(lane,),daemon=True) for lane in self.lanes}
+        self.sweeper=threading.Thread(target=self._sweep_lends,daemon=True)
         self.rates=text_rates.TextRates()
         self.mesa=mesa_check.MesaCheck();self.mesa.warnings()   # logged at start, then on every change
         if start_worker:
             for thread in self.threads.values():thread.start()
+            self.sweeper.start()
             threading.Thread(target=self._sample_text,daemon=True).start()
 
     def _sample_text(self):
@@ -192,9 +197,9 @@ class Service:
     def close(self):
         with self.cv:self.closing=True;self.cv.notify_all()
         self.runtime.stop()
-        for thread in self.threads.values():
+        for thread in [*self.threads.values(),self.sweeper]:
             if thread.is_alive():thread.join(timeout=20)
-        if any(thread.is_alive() for thread in self.threads.values()):raise RuntimeError('worker did not settle')
+        if any(thread.is_alive() for thread in [*self.threads.values(),self.sweeper]):raise RuntimeError('worker did not settle')
         self.db.close();self.instance.close()
 
     def _stages(self, kind, request):
@@ -471,8 +476,8 @@ class Service:
         return {k:v for k,v in job.items() if k!='request'}
 
     def _also_running(self, lane):
-        """The other engine calls running beside `running` on a device (see _engine_session)."""
-        ids=[ident for ident in self.calls.get(lane,{}) if ident!=self.running.get(lane)]
+        """The other engine calls (see _engine_session) or shared lends running beside `running` on a device."""
+        ids=[ident for ident in [*self.calls.get(lane,{}),*self.shared.get(lane,{})] if ident!=self.running.get(lane)]
         return self._queue_view('WHERE id IN (%s) ORDER BY created,rowid'%','.join('?'*len(ids)),ids) if ids else []
 
     def _device_view(self, lane):
@@ -734,6 +739,20 @@ class Service:
         self.heartbeats.pop(ident,None)
         if self.shared[lane]:self.running[lane]=next(iter(self.shared[lane]))
         self.cv.notify_all()
+
+    def _sweep_lends(self):
+        """A lend still waiting whose borrower stopped answering fails where it waits, instead of
+        filling the queue until its turn. Its silence counts from its submission or, for one queued
+        before a restart, from the start (its borrower may be retrying meanwhile)."""
+        with self.cv:
+            while not self.closing:
+                self.cv.wait(timeout=LEND_SWEEP_S)
+                now=time.time()
+                for row in self.db.execute("SELECT id FROM jobs WHERE kind='lend' AND waiting=1").fetchall():
+                    if now-self.heartbeats.setdefault(row['id'],now)<=LEND_HEARTBEAT_S:continue
+                    with self.db:self.db.execute("UPDATE jobs SET status='failed',error=?,waiting=0,updated=? WHERE id=? AND waiting=1",
+                                                 ('the borrower stopped answering while it waited (no heartbeat for %d s); nothing was lent'%LEND_HEARTBEAT_S,now,row['id']))
+                    self.heartbeats.pop(row['id'],None);self.cv.notify_all()
 
     def _work(self, lane):
         """One device's queue: its waiting stages in order, engine calls first; idle restore after."""

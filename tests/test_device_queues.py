@@ -19,7 +19,7 @@ import job_service
 
 ROOT=Path(__file__).resolve().parents[1]
 ORIGIN={'project':'project-fixture','shot':'shot-fixture','shot_revision':1}
-FAST={'IDLE_COALESCE_S':.05,'BLOCKED_RECHECK_S':.05}
+FAST={'IDLE_COALESCE_S':.05,'BLOCKED_RECHECK_S':.05,'LEND_SWEEP_S':.05}
 
 
 class LaneRuntime:
@@ -351,6 +351,23 @@ class LendRestartTests(unittest.TestCase):
             self.assertEqual((job['status'],job['lent']),('running',None),'a restart now finds nothing to restore')
             held.set();s.call('job_wait',{'job_id':j['id'],'timeout':5})
         finally:held.set();s.close()
+    def test_a_lend_waiting_at_a_restart_counts_its_borrower_silence_from_the_start(self):
+        s=Service(ROOT,self.state,LaneRuntime(),start_worker=False)
+        try:
+            old=time.time()-3600   # submitted an hour ago, its last heartbeat in the service that stopped
+            with s.db:s.db.execute("INSERT INTO jobs(id,project,kind,status,request,created,updated,request_key,request_hash,lane,step,waiting)"
+                                   " VALUES('lend-waiting','','lend','queued',?,?,?,'k','h','gpu0','lend',1)",
+                                   (json.dumps({'device':'gpu0','mode':'queued','hours':1,'owner':'lab'}),old,old))
+        finally:s.close()
+        rt=LaneRuntime();s=Service(ROOT,self.state,rt)
+        try:
+            deadline=time.monotonic()+5
+            while s.call('lend_get',{'job_id':'lend-waiting'})['granted'] is None:
+                self.assertLess(time.monotonic(),deadline,s.call('job_get',{'job_id':'lend-waiting'}).get('error'));time.sleep(.01)
+            s.call('lend_return',{'job_id':'lend-waiting'})
+            self.assertEqual(s.call('job_wait',{'job_id':'lend-waiting','timeout':5})['result']['reason'],'returned')
+        finally:s.close()
+
     def test_a_lend_of_a_device_no_longer_configured_is_interrupted(self):
         self.crashed_with(('lend-gone','gpu7','exclusive',time.time()+3600))
         rt=LaneRuntime();s=Service(ROOT,self.state,rt)
@@ -406,6 +423,22 @@ class LendTests(QueueHarness):
             late=self.lend('late');time.sleep(.5);held.set()
             failed=self.wait(late);self.assertEqual(failed['status'],'failed');self.assertIn('stopped answering',failed['error'])
             self.assertEqual(len(self.rt.lends),1,'the second request was never lent anything');self.wait(x)
+
+    def test_a_waiting_lend_whose_borrower_went_silent_fails_where_it_waits(self):
+        with patch.object(job_service,'LEND_HEARTBEAT_S',.5):
+            held=self.rt.gate('sample:x');x=self.render('x');self.rt.wait_started('sample:x')
+            silent=self.lend('silent');kept=self.lend('kept');stop=threading.Event()
+            def beat():
+                while not stop.wait(.1):self.call('lend_heartbeat',job_id=kept['id'])
+            threading.Thread(target=beat,daemon=True).start()
+            try:
+                failed=self.wait(silent);self.assertEqual(failed['status'],'failed');self.assertIn('stopped answering while it waited',failed['error'])
+                self.assertEqual(self.job(kept)['status'],'queued','its borrower answers: it keeps its place')
+                self.assertEqual(self.rt.lends,[],'failed while x still held the device')
+                held.set();self.until(lambda:self.granted(kept) is not None,what='kept granted')
+                self.call('lend_return',job_id=kept['id']);self.wait(kept)
+            finally:stop.set()
+        self.wait(x)
 
     def test_the_deadline_takes_the_device_back(self):
         short=self.lend('short',hours=.5/3600)
@@ -472,6 +505,7 @@ class SharedLendTests(QueueHarness):
         self.assertIsNone(self.granted(c),'48 + 24 GiB do not fit in 64');self.assertEqual(self.job(c)['status'],'queued')
         lane=self.call('resource_status')['lanes']['gpu0']
         self.assertEqual([(l['job_id'],l['vram_gib'],l.get('label')) for l in lane['shared']],[(a['id'],24,'seed 1'),(b['id'],24,None)])
+        self.assertEqual((lane['running']['id'],[j['id'] for j in lane['also_running']]),(a['id'],[b['id']]),'gpu_top lists both under run')
         with self.assertRaisesRegex(ValueError,'return the lent devices first: gpu0 to lab \\(seed 1\\)'):self.call('resource_release')
         self.call('lend_return',job_id=a['id'])
         done=self.wait(a);self.assertEqual((done['status'],done['result']['reason'],done['lent']),('completed','returned',None))
@@ -750,6 +784,25 @@ class BorrowCliTests(unittest.TestCase):
         status=self.borrow('status');self.assertIn('lent (exclusive) to trainer (PR A/B)',status.stdout)
         self.assertEqual(self.borrow('release',row['id']).stdout.strip(),'running')
         self.assertEqual(self.s.call('job_wait',{'job_id':row['id'],'timeout':5})['status'],'completed')
+
+    def test_a_runtime_restart_does_not_end_a_waiting_borrow(self):
+        import os,subprocess
+        held=self.rt.gate('sample:x')
+        x=self.s.call('render',{'request':{'prompt':'x','origin':ORIGIN},'request_key':'x'});self.rt.wait_started('sample:x')
+        p=subprocess.Popen([sys.executable,str(ROOT/'runtime'/'gpu_borrow.py'),'--socket',self.sock,'run','--device','gpu0','--','true'],
+                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        deadline=time.monotonic()+10
+        while not self.lends():
+            self.assertLess(time.monotonic(),deadline);time.sleep(.05)
+        time.sleep(1.2)   # polling for its turn
+        # The socket is gone for a moment, as while the runtime's container restarts.
+        self.server.shutdown();self.server.server_close();os.unlink(self.sock);time.sleep(2)
+        self.server=job_service.Server(self.sock,job_service.Handler);self.server.service=self.s
+        threading.Thread(target=self.server.serve_forever,daemon=True).start()
+        held.set()
+        out,err=p.communicate(timeout=30);self.assertEqual(p.returncode,0,err)
+        [row]=self.lends();self.assertEqual(row['status'],'completed')
+        self.s.call('job_wait',{'job_id':x['id'],'timeout':5})
 
     def test_run_shares_the_device_with_vram_gib(self):
         import subprocess

@@ -35,6 +35,7 @@ import uuid
 
 HEARTBEAT_S=20
 KILL_GRACE_S=60
+RESTART_GRACE_S=300   # the runtime restarting: its socket is gone or refuses for a moment; a call retries this long
 def default_socket(script):
     """GPU_RUNTIME_SOCKET, else state/runtime.sock in the checkout `script` was run from (the path it
     was called by, not where a symlink to it points)."""
@@ -49,11 +50,19 @@ class UnixConnection(http.client.HTTPConnection):
 
 
 def call(path, action, **arguments):
-    connection=UnixConnection(str(path))
-    try:
-        connection.request('POST','/rpc',json.dumps({'action':action,'arguments':arguments}),{'Content-Type':'application/json'})
-        reply=json.loads(connection.getresponse().read())
-    finally:connection.close()
+    """One request to the runtime. While its socket is missing, refuses or drops the connection (a
+    restart), the request is sent again for up to RESTART_GRACE_S: every action here may be repeated
+    (a submission by its request_key returns the same job)."""
+    give_up=time.monotonic()+RESTART_GRACE_S;pause=.5
+    while True:
+        connection=UnixConnection(str(path))
+        try:
+            connection.request('POST','/rpc',json.dumps({'action':action,'arguments':arguments}),{'Content-Type':'application/json'})
+            reply=json.loads(connection.getresponse().read());break
+        except (FileNotFoundError,ConnectionRefusedError,ConnectionResetError):
+            if time.monotonic()+pause>give_up:raise
+            time.sleep(pause);pause=min(2*pause,10)
+        finally:connection.close()
     if 'error' in reply:raise SystemExit('gpu_borrow: '+reply['error'])
     return reply['result']
 
