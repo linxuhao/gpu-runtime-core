@@ -1,6 +1,6 @@
 """One queue per device: a job waits in one device's queue at a time, a render is two stages
 (encode, then sample), nothing holds one device while it waits for another, and a device can be
-lent to research in queued or exclusive mode. Service behaviour runs against a two-device fake
+lent to research in queued, shared or exclusive mode. Service behaviour runs against a two-device fake
 runtime (renders: app_fixture), and the borrow CLI against a real service socket."""
 import json
 from pathlib import Path
@@ -35,6 +35,7 @@ class LaneRuntime:
         self.lock=threading.Lock();self.log=[];self.live={'gpu0':0,'gpu1':0};self.max_live={'gpu0':0,'gpu1':0}
         self.stopped=[];self.parked=[];self.lends=[];self.reclaimed=[];self.foreign={}
         self.fallback=None;self.engine_fallback=None;self.encoded_on={};self.engine_on={};self.loaded={};self.restored=[]
+        self.vram={'gpu0':64,'gpu1':24};self.measured=[]   # GiB free on an emptied card; lend_room calls
     def lane_for(self,fallback):
         down=lambda d:d in self.lent or d in self.blocked
         return fallback if fallback and down('gpu1') and not down(fallback) else 'gpu1'
@@ -91,6 +92,8 @@ class LaneRuntime:
     def restore_lend(self,device,record):
         self.restored.append((device,record));self.lent[device]=record
         return {'CUDA_VISIBLE_DEVICES':'GPU-'+device}
+    def lend_room(self,device,need,declared):
+        self.measured.append((device,need,declared));return declared+need<=self.vram[device]
     def reclaim(self,device):
         self.lent.pop(device,None);self.reclaimed.append(device);return self.check_device(device)
 
@@ -103,7 +106,7 @@ class QueueHarness(unittest.TestCase):
         self.s=Service(ROOT,self.state,self.rt)
     def tearDown(self):
         for gate in self.rt.gates.values():gate.set()
-        for lend in list(self.s.lends.values()):lend['returned']=True
+        for lend in [*self.s.lends.values(),*(l for lends in self.s.shared.values() for l in lends.values())]:lend['returned']=True
         with self.s.cv:self.s.cv.notify_all()
         self.s.close();self.temp.cleanup()
         for p in self.patches:p.stop()
@@ -114,6 +117,7 @@ class QueueHarness(unittest.TestCase):
         return self.call('engine_submit',engine='audio',path=path,method='POST',body='',content_type='audio/wav',request_key=key)
     def lend(self,key,device='gpu0',mode='queued',hours=1,owner='lab',**extra):
         return self.call('lend_submit',device=device,mode=mode,hours=hours,owner=owner,request_key=key,**extra)
+    def share(self,key,vram_gib,**extra):return self.lend(key,mode='shared',vram_gib=vram_gib,**extra)
     def job(self,j):return self.call('job_get',job_id=j['id'])
     def wait(self,j,timeout=5):return self.call('job_wait',job_id=j['id'],timeout=timeout)
     def until(self,predicate,timeout=5,what='condition'):
@@ -449,10 +453,90 @@ class LendTests(QueueHarness):
         for args,message in (({'device':'gpu9'},'unknown device'),({'mode':'forever'},'mode must be'),
                              ({'hours':0},'hours must be'),({'hours':13},'at most 12 in queued'),
                              ({'mode':'exclusive','hours':24*15},'at most 336'),({'owner':' '},'owner'),
-                             ({'label':' '},'label'),({'label':'x'*101},'label'),({'label':7},'label')):
+                             ({'label':' '},'label'),({'label':'x'*101},'label'),({'label':7},'label'),
+                             ({'mode':'shared'},'declares the VRAM'),({'mode':'shared','vram_gib':0},'vram_gib above 0'),
+                             ({'mode':'shared','vram_gib':True},'vram_gib'),({'vram_gib':8},'for shared lends')):
             with self.subTest(args=args),self.assertRaisesRegex(ValueError,message):
                 self.call('lend_submit',**{'device':'gpu0','mode':'queued','hours':1,'owner':'lab','request_key':'bad',**args})
         self.assertEqual(self.lend('ok',mode='exclusive',hours=24*14)['kind'],'lend')
+
+
+class SharedLendTests(QueueHarness):
+    """Shared lends: side by side on one card while what they declare fits (gpu0: 64 GiB here)."""
+    def test_shared_lends_that_fit_hold_the_device_together(self):
+        a=self.share('a',24,label='seed 1');b=self.share('b',24)
+        self.until(lambda:self.granted(a) and self.granted(b),what='both granted')
+        self.assertEqual(self.granted(b)['env'],{'CUDA_VISIBLE_DEVICES':'GPU-gpu0'})
+        self.assertEqual(len(self.rt.lends),1,'the device was emptied once');self.assertEqual(self.rt.lent['gpu0']['mode'],'shared')
+        c=self.share('c',24);time.sleep(.2)
+        self.assertIsNone(self.granted(c),'48 + 24 GiB do not fit in 64');self.assertEqual(self.job(c)['status'],'queued')
+        lane=self.call('resource_status')['lanes']['gpu0']
+        self.assertEqual([(l['job_id'],l['vram_gib'],l.get('label')) for l in lane['shared']],[(a['id'],24,'seed 1'),(b['id'],24,None)])
+        with self.assertRaisesRegex(ValueError,'return the lent devices first: gpu0 to lab \\(seed 1\\)'):self.call('resource_release')
+        self.call('lend_return',job_id=a['id'])
+        done=self.wait(a);self.assertEqual((done['status'],done['result']['reason'],done['lent']),('completed','returned',None))
+        self.until(lambda:self.granted(c) is not None,what='c joins once a has left')
+        self.assertEqual(self.rt.reclaimed,[],'b and c still hold it')
+        self.call('lend_return',job_id=b['id']);self.call('lend_return',job_id=c['id'])
+        self.wait(b);self.wait(c);self.until(lambda:self.rt.reclaimed==['gpu0'],what='reclaimed once, after the last')
+        self.assertEqual(len(self.rt.lends),1)
+
+    def test_nothing_jumps_the_head_and_another_job_ends_the_joining(self):
+        a=self.share('a',40);self.until(lambda:self.granted(a) is not None,what='a granted')
+        big=self.share('big',40);small=self.share('small',8);time.sleep(.2)
+        self.assertIsNone(self.granted(small),'small fits, but big is ahead of it')
+        self.call('lend_return',job_id=a['id'])
+        self.until(lambda:self.granted(big) and self.granted(small),what='big and small together')
+        q=self.lend('q');late=self.share('late',8);time.sleep(.2)
+        self.assertIsNone(self.granted(late),'a queued lend at the head lets nothing more join')
+        self.call('lend_return',job_id=big['id']);self.call('lend_return',job_id=small['id'])
+        self.until(lambda:self.granted(q) is not None,what='q granted after the shared ones')
+        self.assertIsNone(self.granted(late))
+        self.call('lend_return',job_id=q['id']);self.until(lambda:self.granted(late) is not None,what='late after q')
+        self.call('lend_return',job_id=late['id']);self.wait(late)
+        self.assertEqual(self.rt.reclaimed,['gpu0']*4,'after a, after big and small, after q, after late')
+
+    def test_a_render_waits_for_the_last_shared_lend(self):
+        a=self.share('a',8);b=self.share('b',8);self.until(lambda:self.granted(a) and self.granted(b),what='granted')
+        r=self.render('r');self.until(lambda:self.between(r),what='r between stages')
+        self.call('lend_return',job_id=a['id']);time.sleep(.2)
+        self.assertNotIn(('start','sample:r'),self.rt.log,'b still holds gpu0')
+        self.call('lend_return',job_id=b['id'])
+        self.assertEqual(self.wait(r)['status'],'completed')
+
+    def test_each_ends_on_its_own_deadline_heartbeat_or_cancel(self):
+        with patch.object(job_service,'LEND_HEARTBEAT_S',.5):
+            short=self.share('short',8,hours=.3/3600);silent=self.share('silent',8);kept=self.share('kept',8);gone=self.share('gone',8)
+            self.until(lambda:all(self.granted(j) for j in (short,silent,kept,gone)),what='all granted')
+            self.call('job_cancel',job_id=gone['id'])
+            stop=threading.Event()
+            def beat():
+                while not stop.wait(.1):self.call('lend_heartbeat',job_id=kept['id'])
+            threading.Thread(target=beat,daemon=True).start()
+            try:
+                self.assertEqual(self.wait(short)['result']['reason'],'deadline passed')
+                self.assertEqual(self.wait(silent)['result']['reason'],'borrower stopped answering')
+                self.assertEqual(self.wait(gone)['status'],'cancelled')
+                self.assertIsNotNone(self.granted(kept));self.assertEqual(self.rt.reclaimed,[])
+                self.call('lend_return',job_id=kept['id']);self.wait(kept)
+            finally:stop.set()
+        self.until(lambda:self.rt.reclaimed==['gpu0'],what='reclaimed')
+
+    def test_one_bigger_than_the_card_fails(self):
+        huge=self.share('huge',80)
+        failed=self.wait(huge);self.assertEqual(failed['status'],'failed');self.assertIn('needs 80 GiB',failed['error'])
+        self.until(lambda:self.rt.reclaimed==['gpu0'],what='given back')
+
+    def test_shared_lends_survive_a_restart(self):
+        a=self.share('a',8);b=self.share('b',8);self.until(lambda:self.granted(a) and self.granted(b),what='granted')
+        self.s.close()
+        rt=LaneRuntime();self.rt=rt;self.s=Service(ROOT,self.state,rt)
+        self.assertEqual([d for d,_ in rt.restored],['gpu0'],'lent again once');self.assertEqual(rt.lends,[])
+        self.assertEqual({self.granted(j)['job_id'] for j in (a,b)},{a['id'],b['id']})
+        c=self.share('c',8);self.until(lambda:self.granted(c) is not None,what='c joins the restored ones')
+        for j in (a,b,c):self.call('lend_return',job_id=j['id'])
+        self.assertEqual([self.wait(j)['result']['reason'] for j in (a,b,c)],['returned']*3)
+        self.until(lambda:rt.reclaimed==['gpu0'],what='reclaimed')
 
 
 class FallbackTests(QueueHarness):
@@ -605,7 +689,7 @@ class BorrowCliTests(unittest.TestCase):
         self.server=job_service.Server(self.sock,job_service.Handler);self.server.service=self.s
         threading.Thread(target=self.server.serve_forever,daemon=True).start()
     def tearDown(self):
-        for lend in list(self.s.lends.values()):lend['returned']=True
+        for lend in [*self.s.lends.values(),*(l for lends in self.s.shared.values() for l in lends.values())]:lend['returned']=True
         with self.s.cv:self.s.cv.notify_all()
         self.server.shutdown();self.server.server_close();self.s.close();self.temp.cleanup()
         for p in self.patches:p.stop()
@@ -666,5 +750,17 @@ class BorrowCliTests(unittest.TestCase):
         status=self.borrow('status');self.assertIn('lent (exclusive) to trainer (PR A/B)',status.stdout)
         self.assertEqual(self.borrow('release',row['id']).stdout.strip(),'running')
         self.assertEqual(self.s.call('job_wait',{'job_id':row['id'],'timeout':5})['status'],'completed')
+
+    def test_run_shares_the_device_with_vram_gib(self):
+        import subprocess
+        p=subprocess.Popen([sys.executable,str(ROOT/'runtime'/'gpu_borrow.py'),'--socket',self.sock,'run','--device','gpu0','--vram-gib','12',
+                            '--label','seed 1','--','sh','-c','touch %s; exec sleep 30'%(self.state/'started')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            deadline=time.monotonic()+10
+            while not (self.state/'started').exists():   # the command runs: the tool holds the grant
+                self.assertLess(time.monotonic(),deadline);time.sleep(.05)
+            self.assertIn('shared 12.0 GiB with',self.borrow('status').stdout)
+        finally:p.terminate();p.wait(10)
+        [row]=self.lends();self.assertEqual(self.s.call('job_wait',{'job_id':row['id'],'timeout':5})['status'],'completed')
 
 if __name__=='__main__':unittest.main()

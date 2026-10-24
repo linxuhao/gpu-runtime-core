@@ -19,7 +19,8 @@ edit of the config, not of the code.
   is lent, blocked or drained, and with `spill` also while its own card is busy with someone else.
   A call may restrict itself to some cards (`devices`) when outputs must be bit-identical.
 - **Lending.** A card can be lent to a person or a script (`gpu_borrow.py`): queued among the jobs,
-  or exclusively for days; nothing of the runtime touches it until it is returned.
+  shared with other borrowers that each declare the VRAM they need, or exclusively for days; nothing
+  of the runtime touches it until it is returned.
 - **Foreign processes.** A process on a card that the runtime did not start blocks that card; it is
   never killed.
 - **Provenance.** Every reply names the device (`X-GPU-Device`) and the process (`X-GPU-Backend`)
@@ -170,6 +171,7 @@ with the same request returns the same job, with another request it is refused.
 
 ```bash
 python3 runtime/gpu_borrow.py run --device gpu0 --hours 2 -- python train.py   # queued; only gpu0 visible
+python3 runtime/gpu_borrow.py run --device gpu0 --vram-gib 12 -- python eval.py   # shared with other shared lends
 python3 runtime/gpu_borrow.py reserve --device gpu0 --hours 72 --label "fine-tune"   # exclusive; prints the env
 python3 runtime/gpu_borrow.py release LEND_ID
 python3 runtime/gpu_drain.py gpu1              # finish its queue, take nothing new, then empty it
@@ -178,6 +180,15 @@ python3 runtime/gpu_drain.py --resume gpu1
 
 `--owner` (default user@host) says who borrows, `--label` what for; gpu_top and `gpu_borrow.py status`
 show both beside the lend.
+
+A shared lend (`--vram-gib`, `lend_submit` with `mode: "shared"` and `vram_gib`) queues like a queued
+one. When it reaches the head the card is emptied once, and every shared lend that comes to the head
+after it joins while the card has room for what it declares beside the others (what they declare, or
+what the card reports used if more, plus the device's `vram_margin_gib`). A head that does not fit
+waits for room and nothing behind it jumps it; any other job at the head lets nothing more join. Each
+shared lend ends on its own (return, deadline, missed heartbeat, cancel); the card is taken back after
+the last one, and what is left on it then blocks it. The declaration is not enforced: a borrower that
+takes more than it declared can run the others out of memory.
 
 ### Power limits
 

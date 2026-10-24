@@ -806,6 +806,17 @@ class Scheduler:
         env['CUDA_VISIBLE_DEVICES']=device.uuid if device.vendor=='nvidia' else ''
         return env
 
+    def lend_room(self, name, need_gib, declared_gib):
+        """Whether a shared lend declaring `need_gib` fits on lent device `name` beside the shared
+        lends there, which declare `declared_gib` together: what the card reports used, or what they
+        declare if more, plus the device's margin (as _room)."""
+        device=self.devices[name];deadline=time.monotonic()+VRAM_SETTLE_S
+        while True:
+            total,used=device.vram()
+            if total-max(used,declared_gib*GIB)-device.vram_margin>=need_gib*GIB:return True
+            if declared_gib or time.monotonic()>=deadline:return False   # only an emptied card is still settling
+            time.sleep(.25)
+
     def reclaim(self, name):
         """Take a lent device back. Whatever of the borrower is still on it blocks it (see
         check_device); returns those processes, empty when the device is clear."""

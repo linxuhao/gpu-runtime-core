@@ -71,6 +71,12 @@ class LruPlacementTests(base.SchedulerHarness):
         self.foreign=10
         with self.assertRaisesRegex(RuntimeError,r'gpu0: 14.0 GiB free, translator needs 19.0 GiB \(\+0.5 margin\)'):self.s._server('translator')
 
+    def test_lend_room_counts_what_shared_lends_declare_or_use_whichever_is_more(self):
+        self.foreign=10   # the shared lends on the card, as measured
+        self.assertTrue(self.s.lend_room('gpu0',13,8),'24 - max(10 used, 8 declared) - 0.5 margin leaves 13.5')
+        self.assertFalse(self.s.lend_room('gpu0',13,12),'12 declared leave 11.5')
+        self.foreign=0;self.assertFalse(self.s.lend_room('gpu0',24,0),'the margin stays free')
+
     def test_an_exclusive_card_is_unchanged(self):
         s=self.scheduler(base.v2(**{'tenants.translator.vram_gib':19,'tenants.audio.vram_gib':3}))
         translator=s._server('translator');s._server('audio')

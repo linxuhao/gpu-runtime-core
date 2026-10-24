@@ -5,6 +5,10 @@
       Queued mode: waits its turn among the agent jobs on that device, runs the command with
       only that device visible, and gives the device back when the command ends. At the
       deadline the command gets SIGTERM, and SIGKILL a minute later. Exits with its exit code.
+  gpu_borrow.py run --device gpu0 --vram-gib 12 [--hours 2] [--label WHAT] -- python train.py ...
+      Shared mode: as queued, but the device is shared with other shared borrowers while what
+      they declare fits on it. Declare the most the command uses: nothing enforces it, and a
+      command that takes more can run the others out of memory.
   gpu_borrow.py reserve --device gpu0 [--hours 72] [--label WHAT]
       Exclusive mode: waits its turn, then the device is research's until `release` or the
       deadline; meanwhile new jobs that need it are refused. Prints the environment to use.
@@ -84,13 +88,14 @@ def wait_for_grant(path, ident):
 
 def submit(path, args, mode):
     extra={'label':args.label} if args.label else {}
+    if getattr(args,'vram_gib',None) is not None:extra['vram_gib']=args.vram_gib
     return call(path,'lend_submit',device=args.device,mode=mode,hours=args.hours,owner=args.owner,
                 request_key='borrow-'+uuid.uuid4().hex,**extra)
 
 
 def run(path, args):
     if not args.command:raise SystemExit('gpu_borrow: give the command after --')
-    job=submit(path,args,'queued');ident=job['id']
+    job=submit(path,args,'queued' if args.vram_gib is None else 'shared');ident=job['id']
     stop=threading.Event();threading.Thread(target=heartbeat,args=(path,ident,stop),daemon=True).start()
     try:
         grant=wait_for_grant(path,ident)
@@ -131,6 +136,8 @@ def status(path):
     for lane,info in state.get('lanes',{}).items():
         lent=info['lent'];line='%-6s queued %-3d active %s'%(lane,info['queued'],info['active'] or '-')
         if lent:line+='  lent (%s) to %s until %s [%s]'%(lent['mode'],lent['owner']+(' (%s)'%lent['label'] if lent.get('label') else ''),when(lent['deadline']),lent['job_id'])
+        for lend in info.get('shared',[]):
+            line+='\n%-6s shared %s GiB with %s until %s [%s]'%('',lend['vram_gib'],lend['owner']+(' (%s)'%lend['label'] if lend.get('label') else ''),when(lend['deadline']),lend['job_id'])
         if info['blocked']:line+='  BLOCKED: '+info['blocked']
         print(line)
     return 0
@@ -145,7 +152,9 @@ def main(argv=None):
         p.add_argument('--hours',type=float,default=None,help='default 2 for run, 72 for reserve')
         p.add_argument('--owner',default=getpass.getuser()+'@'+socket.gethostname())
         p.add_argument('--label',help='what the device is for, shown beside the owner in the queue and gpu_top')
-        if name=='run':p.add_argument('command',nargs=argparse.REMAINDER)
+        if name=='run':
+            p.add_argument('--vram-gib',type=float,default=None,help='share the device: the most VRAM the command uses, in GiB')
+            p.add_argument('command',nargs=argparse.REMAINDER)
     sub.add_parser('release').add_argument('lend_id')
     sub.add_parser('status')
     args=parser.parse_args(argv)

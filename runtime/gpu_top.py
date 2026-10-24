@@ -252,6 +252,8 @@ def frame(state, error, devices, nvidia, amd, width, paint, now, limit):
         title=paint(lane,'1;36')+'  '+device.get('display',lane)+(paint('  ('+card['model']+')','2') if card and card.get('model') else '')
         if info.get('lent'):
             lent=info['lent'];title+='  '+paint('lent %s to %s until %s'%(lent['mode'],whose(lent),time.strftime('%m-%d %H:%M',time.localtime(lent['deadline']))),'35')
+        for lend in info.get('shared') or []:
+            title+='  '+paint('shared %s GiB with %s until %s'%(lend['vram_gib'],whose(lend),time.strftime('%m-%d %H:%M',time.localtime(lend['deadline']))),'35')
         if info.get('blocked'):title+='  '+paint('blocked: '+info['blocked'],'31')
         if info.get('drained'):title+='  '+paint('drained: finishes its queue, takes nothing new','33')
         modes=(info.get('device') or {})

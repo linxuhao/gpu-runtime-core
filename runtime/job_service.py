@@ -13,8 +13,10 @@ A device can also be lent (research, tools/gpu_borrow.py): a `lend` job queues l
 once granted, keeps the device until it is returned, its deadline passes or its borrower stops
 answering. A granted lend is recorded with its job, so a restart within its deadline (a crash, or a
 stop: stopping leaves a granted lend as it is) lends the device again instead of dropping the
-reservation. While a tenant's device is lent or blocked, its new work is queued on its declared
-`fallback` device; an exclusive lend also moves the work already waiting there, and once the device
+reservation. A shared lend declares the VRAM it needs (`vram_gib`): shared lends at the head of the
+queue are granted side by side while the card has room for what they declare, so several small
+experiments use one card at once; nothing else is placed there until the last one ends. While a
+tenant's device is lent or blocked, its new work is queued on its declared `fallback` device; an exclusive lend also moves the work already waiting there, and once the device
 is usable again the work waiting on the fallback moves back. A queue that serves several stages of
 one plugin's jobs prefers the stage whose part is loaded, within BATCH_PASS_LIMIT.
 
@@ -53,9 +55,10 @@ def tenant_column():
     """SQL naming the tenant a waiting engine call or batch job is for (its request's field)."""
     return 'COALESCE(%s) AS tenant'%','.join("json_extract(request,'$.%s')"%key for key in ('engine',*sorted(set(BATCH_JOBS.values()))))
 
-# Lending a device to research. Queued: one command among the agent jobs, briefly. Exclusive: the
-# device is research's for days, and new jobs that need it are refused meanwhile.
-LEND_HOURS={'queued':(2,12),'exclusive':(72,14*24)}     # mode -> (default, most)
+# Lending a device to research. Queued: one command among the agent jobs, briefly. Shared: as
+# queued, beside other shared lends while their declared VRAM fits. Exclusive: the device is
+# research's for days, and new jobs that need it are refused meanwhile.
+LEND_HOURS={'queued':(2,12),'shared':(2,12),'exclusive':(72,14*24)}     # mode -> (default, most)
 LEND_HEARTBEAT_S=180       # a borrower silent this long has gone: its request or its device is taken back
 BLOCKED_RECHECK_S=10       # how often a device blocked by a process not ours is looked at again
 STATUS_WAITING_MAX=50     # resource_status lists at most this many waiting jobs per device (`queued` counts all)
@@ -102,6 +105,7 @@ class Service:
         self.cv=threading.Condition(threading.RLock());self.closing=False;self.draining=False;self.active=None
         self.running={}            # device -> the job (or 'residency') its queue is working on
         self.lends={};self.heartbeats={};self.resumed={};self.passed={}
+        self.shared={}             # device -> {job id: granted record with env} of the shared lends on it
         self.calls={}              # device -> {job id: thread} of the engine calls running side by side there
         self.relaned=None          # the lend/block state _relane last moved jobs for
         self.started={}            # device -> when its running job started (see _steal)
@@ -150,6 +154,11 @@ class Service:
                 # gpu-config.json no longer has that device: nothing to restore it on.
                 with self.db:self.db.execute("UPDATE jobs SET status='interrupted',error=?,waiting=0,lent=NULL,updated=? WHERE id=?",
                                              ('Service restarted; device %s is no longer configured'%lane,time.time(),ident))
+                continue
+            if record['mode']=='shared':
+                if lane not in self.shared:self.shared[lane]={};env=self.runtime.restore_lend(lane,self._shared_record(lane))
+                else:env=next(iter(self.shared[lane].values()))['env']
+                self.shared[lane][ident]=dict(record,env=env);self.heartbeats[ident]=time.time();self.resumed.setdefault(lane,ident)
                 continue
             env=self.runtime.restore_lend(lane,record)
             self.lends[lane]=dict(record,env=env);self.heartbeats[ident]=time.time();self.resumed[lane]=ident
@@ -285,6 +294,7 @@ class Service:
                 lanes={lane:{'active':self.running.get(lane),'step':self._step_of(self.running.get(lane)),
                              'queued':self.db.execute('SELECT count(*) FROM jobs WHERE waiting=1 AND lane=?',(lane,)).fetchone()[0],
                              'lent':self._lend_view(self.lends[lane]) if lane in self.lends else None,'blocked':blocked.get(lane),
+                             'shared':[self._lend_view(lend) for lend in self.shared.get(lane,{}).values()],
                              'drained':lane in self.drained,
                              'device':self._device_view(lane),'running':(self._queue_view('WHERE id=?',(self.running.get(lane),)) or [None])[0],
                              'also_running':self._also_running(lane),'text':self.rates.lane(lane),
@@ -300,7 +310,8 @@ class Service:
                 self.draining=False;self.needs_park=dict.fromkeys(self.lanes,hasattr(self.runtime,'park'));self.cv.notify_all()
                 return {'mode':'requested','load':'on the next job or idle residency restore'}
             if action=='resource_release':
-                if self.lends:raise ValueError('return the lent devices first: '+', '.join('%s to %s'%(lane,whose(lend)) for lane,lend in self.lends.items()))
+                lent=[(lane,lend) for lane,lend in self.lends.items()]+[(lane,lend) for lane,lends in self.shared.items() for lend in lends.values()]
+                if lent:raise ValueError('return the lent devices first: '+', '.join('%s to %s'%(lane,whose(lend)) for lane,lend in lent))
                 if self.db.execute("SELECT count(*) FROM jobs WHERE waiting=1").fetchone()[0]:raise ValueError('cancel or finish queued jobs before releasing')
                 self.draining=True
                 if not self.running:self.runtime.stop()
@@ -322,8 +333,7 @@ class Service:
             if action=='lend_get':
                 job=self._job(args['job_id'])
                 if job['kind']!='lend':raise ValueError('not a lend job')
-                lend=self.lends.get(job['lane'])
-                granted=lend if lend and lend['job_id']==job['id'] else None
+                granted=self._granted(job)
                 ahead=None
                 if job['waiting']:
                     ahead=self.db.execute("SELECT count(*) FROM jobs WHERE waiting=1 AND lane=? AND (-urgent,created,rowid)<"
@@ -337,8 +347,8 @@ class Service:
             if action=='lend_return':
                 job=self._job(args['job_id'])
                 if job['kind']!='lend':raise ValueError('not a lend job')
-                lend=self.lends.get(job['lane'])
-                if lend and lend['job_id']==job['id']:
+                lend=self._granted(job)
+                if lend:
                     # Recorded first: a restart before the device is reclaimed must not restore it.
                     with self.db:self.db.execute('UPDATE jobs SET lent=NULL WHERE id=?',(job['id'],))
                     lend['returned']=True;self.cv.notify_all()
@@ -375,13 +385,19 @@ class Service:
     def _lend_submit(self, args):
         if self.draining:raise ValueError('GPU resources released; acquire before submitting')
         mode=args.get('mode','queued')
-        if mode not in LEND_HOURS:raise ValueError('mode must be queued or exclusive')
+        if mode not in LEND_HOURS:raise ValueError('mode must be queued, shared or exclusive')
         default,most=LEND_HOURS[mode];hours=args.get('hours',default)
         if isinstance(hours,bool) or not isinstance(hours,(int,float)) or not 0<hours<=most:
             raise ValueError('hours must be above 0 and at most %d in %s mode'%(most,mode))
         owner=args.get('owner')
         if not isinstance(owner,str) or not 1<=len(owner.strip())<=100:raise ValueError('owner must say who borrows the device (1-100 characters)')
         req={'device':args.get('device'),'mode':mode,'hours':hours,'owner':owner.strip()}
+        vram=args.get('vram_gib')
+        if mode=='shared':
+            if isinstance(vram,bool) or not isinstance(vram,(int,float)) or not 0<vram<=1024:
+                raise ValueError('a shared lend declares the VRAM it needs: vram_gib above 0, at most 1024')
+            req['vram_gib']=vram
+        elif vram is not None:raise ValueError('vram_gib is for shared lends; a %s lend has the whole device'%mode)
         label=args.get('label')
         if label is not None:
             if not isinstance(label,str) or not 1<=len(label.strip())<=100:raise ValueError('label must say what the device is borrowed for (1-100 characters)')
@@ -426,8 +442,19 @@ class Service:
         with self.db:self.db.executemany('DELETE FROM jobs WHERE id=?',[(row['id'],) for row in rows])
         for row in rows:shutil.rmtree(self.state/'jobs'/row['id'],ignore_errors=True)
 
+    def _granted(self, job):
+        """The granted record of lend `job`, or None while it waits or once it ended."""
+        lend=self.lends.get(job['lane'])
+        if lend and lend['job_id']==job['id']:return lend
+        return self.shared.get(job['lane'],{}).get(job['id'])
+
+    @staticmethod
+    def _shared_record(lane):
+        """What the runtime is told a device is lent to while shared lends hold it."""
+        return {'device':lane,'owner':'shared lends','mode':'shared','granted':time.time()}
+
     def _lend_view(self, lend, env=False):
-        view={k:lend[k] for k in ('job_id','device','owner','label','mode','granted','deadline') if k in lend}
+        view={k:lend[k] for k in ('job_id','device','owner','label','mode','granted','deadline','vram_gib') if k in lend}
         if env:view['env']=lend['env']
         return view
 
@@ -635,6 +662,79 @@ class Service:
         with self.cv:self.heartbeats.pop(ident,None)
         return {**record,'returned':time.time(),'reason':reason,'left_behind':left}
 
+    def _lend_session(self, lane, first):
+        """Shared lends on `lane`, side by side. The device is emptied once and handed to `first`, then
+        to each shared lend that reaches the head of this queue while what it declares (`vram_gib`)
+        fits beside those already there (Scheduler.lend_room). A head that does not fit yet waits for
+        room, and nothing behind it jumps it; anything else at the head (a job, a lend of another mode)
+        lets nothing more join. Each ends on its own (returned, cancelled, deadline, borrower silent);
+        the device is reclaimed once the last has ended, and what they left on it blocks it then
+        (check_device). Shared lends restored after a restart are on the device already. Returns
+        'stopping' when the service stops meanwhile: the granted ones stay as they are."""
+        with self.cv:members=self.shared.setdefault(lane,{});restored=first['id'] in members
+        if members:env=next(iter(members.values()))['env']
+        else:
+            env=self.runtime.lend(lane,self._shared_record(lane))
+            with self.cv:self._relane()
+        # Measured outside the lock: a card just emptied takes a moment to show its memory free.
+        fits=restored or self.runtime.lend_room(lane,first['request']['vram_gib'],0)
+        unfit,unfit_at=None,0   # (head, members) last measured too big, so that a wake-up does not measure again at once
+        with self.cv:
+            if not restored:
+                if fits and time.time()-self.heartbeats.get(first['id'],0)<=LEND_HEARTBEAT_S:self._grant_shared(lane,first,env)
+                else:self._refuse_shared(lane,first,'the borrower stopped answering before %s was free; nothing was lent'%lane if fits else
+                                         'needs %s GiB and %s has not that much free'%(first['request']['vram_gib'],lane))
+            while True:
+                now=time.time()
+                for ident,lend in list(members.items()):
+                    reason=('returned' if lend.get('returned') else 'cancelled' if self._job(ident)['status']=='cancelling'
+                            else 'deadline passed' if now>=lend['deadline'] else 'borrower stopped answering' if now-self.heartbeats.get(ident,0)>LEND_HEARTBEAT_S else None)
+                    if reason:self._end_shared(lane,ident,reason,now)
+                if self.closing:
+                    self.running.pop(lane,None);self._active();self.cv.notify_all();return 'stopping'
+                if not members:break
+                row=self._next(lane)
+                head=self._job(row['id']) if row and row['kind']=='lend' else None
+                if head and head['request'].get('mode')=='shared':
+                    if now-self.heartbeats.get(head['id'],0)>LEND_HEARTBEAT_S:
+                        self._refuse_shared(lane,head,'the borrower stopped answering before %s was free; nothing was lent'%lane);continue
+                    if unfit!=(head['id'],tuple(members)) or now-unfit_at>=5:
+                        if self.runtime.lend_room(lane,head['request']['vram_gib'],sum(lend['vram_gib'] for lend in members.values())):
+                            with self.db:self.db.execute("UPDATE jobs SET status='running',waiting=0,updated=? WHERE id=?",(now,head['id']))
+                            self._grant_shared(lane,head,env);unfit=None;continue
+                        unfit,unfit_at=(head['id'],tuple(members)),now
+                until=min(min(lend['deadline'],self.heartbeats.get(ident,0)+LEND_HEARTBEAT_S) for ident,lend in members.items())
+                self.cv.wait(timeout=min(5,max(.05,until-now)))
+            del self.shared[lane]
+        self.runtime.reclaim(lane)
+        with self.cv:
+            self.running.pop(lane,None);self._active()
+            self.needs_park[lane]=hasattr(self.runtime,'park')
+            if self.draining and not self.running:self.runtime.stop()
+            self.cv.notify_all()
+
+    def _grant_shared(self, lane, job, env):
+        """`job` joins the shared lends on `lane`, recorded with its job as any granted lend. Holding self.cv."""
+        now=time.time();req=job['request']
+        record={'job_id':job['id'],'device':lane,'owner':req['owner'],'mode':'shared','vram_gib':req['vram_gib'],'granted':now,'deadline':now+req['hours']*3600}
+        if req.get('label'):record['label']=req['label']
+        with self.db:self.db.execute('UPDATE jobs SET lent=? WHERE id=?',(packed(record),job['id']))
+        self.shared[lane][job['id']]=dict(record,env=env);self.heartbeats[job['id']]=now
+        self.running[lane]=next(iter(self.shared[lane]));self._active();self.cv.notify_all()
+
+    def _refuse_shared(self, lane, job, error):
+        with self.db:self.db.execute("UPDATE jobs SET status='failed',error=?,waiting=0,updated=? WHERE id=?",(error,time.time(),job['id']))
+        self.heartbeats.pop(job['id'],None);self.cv.notify_all()
+
+    def _end_shared(self, lane, ident, reason, now):
+        """A shared lend ends; the others keep the device. Recorded before anything else, as _lend. Holding self.cv."""
+        record={k:v for k,v in self.shared[lane].pop(ident).items() if k not in ('env','returned')}
+        with self.db:self.db.execute('UPDATE jobs SET status=?,result=?,lent=NULL,waiting=0,updated=? WHERE id=?',
+                                     ('cancelled' if reason=='cancelled' else 'completed',packed({**record,'returned':now,'reason':reason}),now,ident))
+        self.heartbeats.pop(ident,None)
+        if self.shared[lane]:self.running[lane]=next(iter(self.shared[lane]))
+        self.cv.notify_all()
+
     def _work(self, lane):
         """One device's queue: its waiting stages in order, engine calls first; idle restore after."""
         while True:
@@ -690,6 +790,9 @@ class Service:
                 continue
             if job['step']=='engine' and self._slots(job)>1:
                 self._engine_session(lane,job);continue
+            if job['step']=='lend' and job['request'].get('mode')=='shared':
+                if self._lend_session(lane,job)=='stopping':return
+                continue
             result=error=following=None
             stage=job['step'] or job['kind']
             try:
